@@ -1,4 +1,12 @@
 node_modules/
+dist/
+build/
+
+# Secrets and local state — never committed.
 .env
 state.jsonl
-dist/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
