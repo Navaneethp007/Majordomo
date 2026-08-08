@@ -177,3 +177,131 @@ def test_chunking_never_loses_or_duplicates_text():
     text = ". ".join(f"sentence number {i} here" for i in range(200))
     chunks = chunk_text(text, max_len=180)
     assert " ".join(chunks).split() == text.split()
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA Riva — gRPC, not HTTP. All mocked; no real gRPC, no real audio.
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+NVIDIA_CFG = VoiceConfig(
+    enabled=True,
+    provider="nvidia",
+    voice_id="Magpie-Multilingual.EN-US.Sofia",
+    model="",
+    api_key_env="NVIDIA_API_KEY",
+    timeout=90.0,
+    function_id="fid-123",
+    language="en-US",
+    sample_rate=44100,
+)
+
+
+def _fake_riva():
+    """A fake riva.client whose synthesize(future=True) mirrors the gRPC future."""
+    fake = types.SimpleNamespace()
+    fake.Auth = mock.MagicMock(name="Auth")
+    call = mock.MagicMock(name="Call")
+    call.result.return_value = types.SimpleNamespace(audio=b"\x01\x02\x03\x04")
+    service = mock.MagicMock(name="Service")
+    service.synthesize.return_value = call
+    fake.SpeechSynthesisService = mock.MagicMock(return_value=service)
+    return fake, types.SimpleNamespace(LINEAR_PCM=1), service
+
+
+def test_nvidia_happy_path(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv-test")
+    fake, encoding, service = _fake_riva()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake, encoding))
+    played = []
+    monkeypatch.setattr(tts, "_play", lambda p: played.append(p))
+
+    tts.speak("Two PRs need your review.", NVIDIA_CFG)
+
+    service.synthesize.assert_called_once()
+    _, kwargs = service.synthesize.call_args
+    assert kwargs["voice_name"] == "Magpie-Multilingual.EN-US.Sofia"
+    assert kwargs["language_code"] == "en-US"
+    assert kwargs["sample_rate_hz"] == 44100
+    assert kwargs["future"] is True, "the sync path has no timeout and can hang forever"
+    assert len(played) == 1
+
+
+def test_nvidia_sends_function_id_and_key_as_metadata(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv-test")
+    fake, encoding, _ = _fake_riva()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake, encoding))
+    monkeypatch.setattr(tts, "_play", lambda p: None)
+
+    tts.speak("Hello.", NVIDIA_CFG)
+
+    _, auth_kwargs = fake.Auth.call_args
+    meta = dict(auth_kwargs["metadata_args"])
+    assert meta["function-id"] == "fid-123"
+    assert meta["authorization"] == "Bearer nv-test"
+
+
+def test_nvidia_missing_function_id_raises(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv-test")
+    fake, encoding, _ = _fake_riva()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake, encoding))
+    monkeypatch.setattr(tts, "_play", lambda p: None)
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello.", VoiceConfig(**{**NVIDIA_CFG.__dict__, "function_id": ""}))
+    assert "function_id" in str(exc.value)
+
+
+def test_nvidia_missing_package_names_the_extra(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv-test")
+    monkeypatch.setattr(tts, "_play", lambda p: None)
+
+    def boom():
+        raise ImportError("no riva")
+
+    monkeypatch.setattr(tts, "_import_riva", boom)
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello.", NVIDIA_CFG)
+    assert "majordomo[nvidia]" in str(exc.value)
+
+
+def test_nvidia_timeout_cancels_the_call(monkeypatch):
+    """A hung synthesis in a scheduled task would sit silently until Windows
+    killed it, so the deadline must be enforced and the call cancelled."""
+    import grpc
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv-test")
+    fake, encoding, service = _fake_riva()
+    service.synthesize.return_value.result.side_effect = grpc.FutureTimeoutError()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake, encoding))
+    monkeypatch.setattr(tts, "_play", lambda p: None)
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello.", NVIDIA_CFG)
+    assert "timed out" in str(exc.value).lower()
+    service.synthesize.return_value.cancel.assert_called_once()
+
+
+def test_nvidia_missing_key_names_the_configured_env(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello.", NVIDIA_CFG)
+    assert "NVIDIA_API_KEY" in str(exc.value)
+
+
+def test_riva_is_an_alias_for_nvidia():
+    """Voicelog calls this engine 'riva'; accept both names."""
+    assert tts.ADAPTERS["riva"] is tts.ADAPTERS["nvidia"]
+
+
+def test_elevenlabs_still_works_alongside(monkeypatch):
+    """Adding a provider must not disturb the one already in use."""
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
+    monkeypatch.setattr(tts, "_play", lambda p: None)
+    response = mock.MagicMock(is_success=True, content=b"\x01\x02")
+
+    with mock.patch("majordomo.tts.httpx.post", return_value=response) as post:
+        tts.speak("Hello.", CFG)
+    post.assert_called_once()

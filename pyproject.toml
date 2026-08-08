@@ -32,6 +32,9 @@ majordomo = "majordomo.cli:main"
 mj = "majordomo.cli:main"
 
 [project.optional-dependencies]
+# NVIDIA Riva speaks gRPC rather than HTTP, so it is an extra — a text-only
+# install has no business pulling in grpc.
+nvidia = ["nvidia-riva-client>=2.14"]
 tray = ["pystray>=0.19", "Pillow>=10.0"]
 dev = ["pytest>=8.0"]
 

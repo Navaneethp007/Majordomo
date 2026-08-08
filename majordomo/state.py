@@ -60,6 +60,7 @@ def _parse_event(raw: Any) -> SessionEvent | None:
 
     topic = raw.get("topic")
     entrypoint = raw.get("entrypoint")
+    kind = raw.get("kind")
 
     return SessionEvent(
         session_id=session_id,
@@ -69,6 +70,7 @@ def _parse_event(raw: Any) -> SessionEvent | None:
         at=at,
         topic=topic if isinstance(topic, str) else None,
         entrypoint=entrypoint if isinstance(entrypoint, str) else None,
+        kind=kind if isinstance(kind, str) else None,
     )
 
 

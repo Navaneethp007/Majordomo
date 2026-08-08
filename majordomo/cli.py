@@ -30,6 +30,31 @@ import sys
 from majordomo import __version__
 
 
+def safe_print(text: str = "", file=None) -> None:
+    """Print text that came from outside, without letting the console kill us.
+
+    ``sys.stdout.encoding`` is **cp1252** on a default Windows console, and
+    ``print('\\U0001f916')`` raises UnicodeEncodeError there. Email subject
+    lines are full of emoji, so anything printing a subject would crash on most
+    runs — and a session topic containing one would do the same.
+
+    Losing a glyph is a cosmetic failure; losing the whole briefing to a
+    traceback is not. So unprintable characters degrade to a replacement mark
+    and the text still lands.
+    """
+    stream = file or sys.stdout
+    if stream is None:  # pythonw.exe: no console at all
+        return
+    try:
+        print(text, file=stream)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(encoding, errors="replace").decode(encoding) + "\n")
+    except (OSError, ValueError):
+        # A closed or detached stream. The briefing is not worth a crash.
+        pass
+
+
 def _load_config(args):
     from majordomo import config as config_module
     from majordomo.config import ConfigFileNotFound
@@ -76,7 +101,10 @@ def should_speak(args, config, briefing, reports=None, now=None) -> bool:
 
     reports = reports or []
     something_needs_you = bool(briefing.needs_you)
-    something_is_down = any(not r.ok for r in reports)
+    # A source that was never set up is not an outage. Counting it as one made
+    # the wake trigger speak on every single wake — the precise noise this flag
+    # exists to prevent.
+    something_is_down = any(not r.ok and not r.unconfigured for r in reports)
     if not (something_needs_you or something_is_down):
         return False
 
@@ -101,17 +129,24 @@ def cmd_brief(args) -> None:
         sys.exit(1)
 
     # Text first, always — never gated on TTS.
-    print(result.briefing.briefing_text)
+    safe_print(result.briefing.briefing_text)
 
     if result.briefing.needs_you:
-        print("\nNeeds you:")
+        safe_print("\nNeeds you:")
         for item in result.briefing.needs_you:
-            print(f"  • [{item.source}] {item.title}")
-            print(f"      {item.detail}")
+            safe_print(f"  • [{item.source}] {item.title}")
+            safe_print(f"      {item.detail}")
+
+    # Separate heading, deliberately. These are things to look at, not things to
+    # do — collapsing them into "Needs you" is how a briefing starts lying.
+    if result.briefing.context:
+        safe_print("\nAlso waiting (nothing required):")
+        for item in result.briefing.context:
+            safe_print(f"  · [{item.source}] {item.title}")
 
     if args.explain:
-        print()
-        print(result.explain())
+        safe_print()
+        safe_print(result.explain())
 
     if should_speak(args, config, result.briefing, result.reports):
         try:
@@ -133,7 +168,14 @@ def _live_sessions(config):
 
     result = state.read_events_detailed()
     return (
-        fold(result.events, stale_after_hours=config.sources.sessions.stale_after_hours),
+        fold(
+            result.events,
+            stale_after_hours=config.sources.sessions.stale_after_hours,
+            # Passed explicitly, or `mj sessions` silently falls back to the
+            # hardcoded default and disagrees with `mj brief` about which
+            # sessions are live.
+            active_timeout_minutes=config.sources.sessions.active_timeout_minutes,
+        ),
         result.skipped,
     )
 
@@ -148,7 +190,7 @@ def cmd_sessions(args) -> None:
         print("No live coding sessions.")
         print("(If you expected some, run `mj install-hooks` first.)", file=sys.stderr)
     for session in live:
-        print(f"{session.status:<20} {session.session_id[:8]}  {describe(session)}")
+        safe_print(f"{session.status:<20} {session.session_id[:8]}  {describe(session)}")
 
     if args.debug and skipped:
         print(f"\n{skipped} unparseable line(s) in the state log.", file=sys.stderr)
@@ -175,7 +217,7 @@ def cmd_resume(args) -> None:
         sys.exit(1)
 
     if args.dry_run:
-        print(command.uri if command.uri else f"{' '.join(command.argv)}  (in {command.cwd})")
+        safe_print(command.uri if command.uri else f"{' '.join(command.argv)}  (in {command.cwd})")
         return
 
     resume_mod.launch(command)

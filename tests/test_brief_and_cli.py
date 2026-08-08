@@ -16,16 +16,29 @@ CFG = config_module.build(config_module.DEFAULTS)
 # ---------------------------------------------------------------------------
 
 def test_gather_runs_every_enabled_worker(monkeypatch, tmp_path):
+    """Gmail ships disabled, so enable it explicitly here."""
     monkeypatch.setattr(brief.github, "run", lambda c: SourceReport("github", True, "gh"))
+    monkeypatch.setattr(brief.gmail, "run", lambda c: SourceReport("gmail", True, "mail"))
+    data = config_module._deep_merge(
+        config_module.DEFAULTS, {"sources": {"gmail": {"enabled": True}}}
+    )
 
-    reports = brief.gather(CFG, tmp_path / "none.jsonl")
+    reports = brief.gather(config_module.build(data), tmp_path / "none.jsonl")
 
-    assert {r.source for r in reports} == {"github", "sessions"}
+    assert {r.source for r in reports} == {"github", "gmail", "sessions"}
+
+
+def test_gmail_ships_disabled():
+    """Nothing provisions Gmail credentials, so left on it would fail every run
+    — and a failing source makes the wake trigger speak, which is the noise
+    --speak-if-needed exists to prevent."""
+    assert CFG.sources.gmail.enabled is False
 
 
 def test_gather_skips_disabled_sources(monkeypatch, tmp_path):
     data = config_module._deep_merge(
-        config_module.DEFAULTS, {"sources": {"github": {"enabled": False}}}
+        config_module.DEFAULTS,
+        {"sources": {"github": {"enabled": False}, "gmail": {"enabled": False}}},
     )
     reports = brief.gather(config_module.build(data), tmp_path / "none.jsonl")
 
@@ -39,6 +52,7 @@ def test_a_worker_thread_that_dies_becomes_a_stub(monkeypatch, tmp_path):
         raise RuntimeError("thread died")
 
     monkeypatch.setattr(brief.github, "run", boom)
+    monkeypatch.setattr(brief.gmail, "run", lambda c: SourceReport("gmail", True, "mail"))
 
     reports = brief.gather(CFG, tmp_path / "none.jsonl")
     github_report = next(r for r in reports if r.source == "github")
@@ -209,25 +223,43 @@ def test_bare_invocation_prints_help(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Wake / boot / login triggers
+# Wake / login triggers
 # ---------------------------------------------------------------------------
+
+LOGON = next(t for t in trigger.TASKS if t.kind == "logon")
+WAKE = next(t for t in trigger.TASKS if t.kind == "wake")
 
 def test_wake_task_uses_the_kernel_power_event():
     """'Woke from sleep' has no first-class trigger — it only exists as an
     event-log record, so it needs an XPath subscription."""
-    xml = trigger.build_task_xml(trigger.TASKS[2], "python.exe", "-m majordomo.cli brief")
+    xml = trigger.build_task_xml(WAKE, "python.exe", "-m majordomo.cli brief")
 
     assert "EventTrigger" in xml
     assert "Kernel-Power" in xml
     assert "EventID=107" in xml
 
 
-def test_logon_and_boot_use_first_class_triggers():
-    logon = trigger.build_task_xml(trigger.TASKS[0], "py.exe", "args")
-    boot = trigger.build_task_xml(trigger.TASKS[1], "py.exe", "args")
+def test_logon_uses_a_first_class_trigger():
+    assert "LogonTrigger" in trigger.build_task_xml(LOGON, "py.exe", "args")
 
-    assert "LogonTrigger" in logon
-    assert "BootTrigger" in boot
+
+def test_logon_task_is_scoped_to_the_current_user():
+    """Without a UserId the trigger covers every account on the machine, which
+    needs administrator rights — that was the real cause of the
+    `mj install-trigger` "Access is denied." failure."""
+    xml = trigger.build_task_xml(LOGON, "py.exe", "args")
+    assert f"<UserId>{trigger.current_user()}</UserId>" in xml
+    assert xml.count("<UserId>") == 2, "both the trigger and the principal need it"
+
+
+def test_there_is_no_boot_trigger():
+    """A BootTrigger runs before login, so Windows treats it as machine-level
+    and refuses without elevation. It also buys nothing: a boot is always
+    followed by a logon, so it only ever added a duplicate briefing."""
+    kinds = {t.kind for t in trigger.TASKS}
+    assert kinds == {"logon", "wake"}
+    for spec in trigger.TASKS:
+        assert "BootTrigger" not in trigger.build_task_xml(spec, "py.exe", "args")
 
 
 def test_task_xml_is_wellformed_with_awkward_characters():
@@ -243,7 +275,7 @@ def test_task_xml_is_wellformed_with_awkward_characters():
 
 def test_task_does_not_wake_the_machine():
     """A briefing must never be the reason a laptop wakes up or stays awake."""
-    xml = trigger.build_task_xml(trigger.TASKS[0], "py.exe", "args")
+    xml = trigger.build_task_xml(LOGON, "py.exe", "args")
     assert "<StartWhenAvailable>false</StartWhenAvailable>" in xml
 
 
@@ -319,7 +351,7 @@ def test_wake_trigger_uses_the_conditional_flag():
 
 
 def test_task_xml_carries_the_real_arguments():
-    xml = trigger.build_task_xml(trigger.TASKS[2], "pythonw.exe", trigger.BRIEF_ARGUMENTS)
+    xml = trigger.build_task_xml(WAKE, "pythonw.exe", trigger.BRIEF_ARGUMENTS)
     assert trigger.BRIEF_ARGUMENTS in xml
 
 
@@ -401,3 +433,117 @@ def test_manual_brief_ignores_the_gate_entirely():
     args = _Args()
     assert cli.should_speak(args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0) is True
     assert cli.should_speak(args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0) is True
+
+
+# ---------------------------------------------------------------------------
+# safe_print — a cp1252 console must not be able to kill a briefing
+# ---------------------------------------------------------------------------
+
+def test_safe_print_survives_an_unencodable_character():
+    """sys.stdout.encoding is cp1252 on a default Windows console, where
+    print('\U0001f916') raises UnicodeEncodeError. Marketing subject lines are
+    full of emoji, so this would crash mj brief on most runs."""
+    import io
+
+    buffer = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+    cli.safe_print("Automated run finished \U0001f916", file=buffer)
+
+    buffer.seek(0)
+    assert "Automated run finished" in buffer.read()
+
+
+def test_safe_print_is_a_noop_without_a_console():
+    """pythonw.exe under Task Scheduler may have no stdout at all."""
+    cli.safe_print("anything", file=None) if False else None
+    import majordomo.cli as m
+    real, m.sys.stdout = m.sys.stdout, None
+    try:
+        m.safe_print("must not raise")
+    finally:
+        m.sys.stdout = real
+
+
+def test_context_is_printed_under_its_own_heading(monkeypatch, capsys):
+    """'Also waiting' must be visually separate from 'Needs you' — merging them
+    is how a digest turns into a to-do list."""
+    from majordomo.models import ContextItem
+
+    mail = ContextItem(kind="unread_mail", title="Priya: Invoice rounding",
+                       detail="Unread.", source="gmail")
+    monkeypatch.setattr(
+        brief, "run",
+        lambda c, s=None: brief.BriefResult(briefing=Briefing("Quiet.", [], [mail])),
+    )
+
+    cli.main(["brief", "--no-speak"])
+    out = capsys.readouterr().out
+
+    assert "Also waiting" in out
+    assert "Needs you" not in out
+    assert "Priya: Invoice rounding" in out
+
+
+# ---------------------------------------------------------------------------
+# An unconfigured source is not an outage
+# ---------------------------------------------------------------------------
+
+def test_an_unconfigured_source_does_not_make_the_wake_trigger_speak():
+    """"You never gave me a Gmail password" is a setup state, not news. Treating
+    it as an outage made the trigger talk aloud on every single wake."""
+    stub = SourceReport.failed("gmail", "no Gmail credentials", unconfigured=True)
+
+    assert cli.should_speak(
+        _Args(speak_if_needed=True), CFG, Briefing("quiet", []), [stub], now=T0
+    ) is False
+
+
+def test_a_genuinely_broken_source_still_speaks():
+    """A source that was working and stopped is worth interrupting for."""
+    stub = SourceReport.failed("github", "401 token expired")
+
+    assert cli.should_speak(
+        _Args(speak_if_needed=True), CFG, Briefing("github is down", []), [stub], now=T0
+    ) is True
+
+
+def test_sessions_and_brief_agree_on_liveness(monkeypatch):
+    """_live_sessions used to drop active_timeout_minutes, so `mj sessions` used
+    the hardcoded default while `mj brief` used the configured value."""
+    captured = {}
+    import majordomo.workers.sessions as sessions_mod
+
+    def spy(events, now=None, stale_after_hours=72, active_timeout_minutes=90):
+        captured["timeout"] = active_timeout_minutes
+        return []
+
+    monkeypatch.setattr("majordomo.workers.sessions.fold", spy)
+    data = config_module._deep_merge(
+        config_module.DEFAULTS, {"sources": {"sessions": {"active_timeout_minutes": 15}}}
+    )
+    cli._live_sessions(config_module.build(data))
+
+    assert captured["timeout"] == 15
+
+
+# ---------------------------------------------------------------------------
+# A retired scheduled task must still be removable
+# ---------------------------------------------------------------------------
+
+def test_uninstall_sweeps_retired_task_names():
+    """Dropping OnBoot from TASKS without this would make it unremovable — a
+    live duplicate briefing beyond the reach of the fix that removed it."""
+    deleted = []
+    import majordomo.trigger as trig
+
+    real = trig._run_schtasks
+    trig._run_schtasks = lambda args: (
+        deleted.append(args[2]) or type("R", (), {"returncode": 0})()
+    )
+    try:
+        trig.uninstall()
+    finally:
+        trig._run_schtasks = real
+
+    assert r"Majordomo\OnBoot" in deleted
+    assert r"Majordomo\OnLogon" in deleted
+    assert r"Majordomo\OnWake" in deleted

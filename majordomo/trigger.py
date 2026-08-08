@@ -13,6 +13,8 @@ containing an ``&`` produces a valid document instead of a corrupt one.
 """
 from __future__ import annotations
 
+import getpass
+import os
 import subprocess
 import sys
 import tempfile
@@ -53,11 +55,40 @@ class TaskSpec:
     description: str
 
 
+#: Two triggers, not three.
+#:
+#: There is no OnBoot. A BootTrigger runs before anyone logs in, so Windows
+#: treats it as a machine-level task and refuses to register it without
+#: elevation — and on a personal machine it buys nothing anyway, because a boot
+#: is always followed by a logon. All it ever contributed was a second briefing
+#: a minute after the first, and a UAC prompt during install.
+#:
+#: Both of these register as the current user with no elevation.
 TASKS = [
-    TaskSpec(f"{TASK_PREFIX}\\OnLogon", "logon", "Brief me when I log in"),
-    TaskSpec(f"{TASK_PREFIX}\\OnBoot", "boot", "Brief me when the machine boots"),
+    TaskSpec(f"{TASK_PREFIX}\\OnLogon", "logon", "Brief me when I log in (covers boot too)"),
     TaskSpec(f"{TASK_PREFIX}\\OnWake", "wake", "Brief me when the machine wakes from sleep"),
 ]
+
+#: Tasks earlier versions registered and this one no longer creates.
+#:
+#: Removing OnBoot from TASKS alone would have made it *unremovable*: uninstall
+#: only sweeps what TASKS lists, so anyone who had already installed would keep
+#: a live Majordomo\OnBoot firing a second briefing a minute after logon — the
+#: exact duplicate the removal was meant to fix, now beyond the reach of both
+#: install and uninstall. So both sweep this list too.
+LEGACY_TASK_NAMES = [f"{TASK_PREFIX}\\OnBoot"]
+
+
+def current_user() -> str:
+    """DOMAIN\\user for the task principal.
+
+    Without a UserId, a LogonTrigger applies to *every* user on the machine,
+    which requires administrator rights — that is the whole reason
+    `mj install-trigger` used to fail with "Access is denied."
+    """
+    domain = os.environ.get("USERDOMAIN", "")
+    user = getpass.getuser()
+    return f"{domain}\\{user}" if domain else user
 
 
 def _sub(parent: ET.Element, tag: str, text: str | None = None) -> ET.Element:
@@ -76,15 +107,17 @@ def build_task_xml(spec: TaskSpec, command: str, arguments: str) -> str:
     _sub(registration, "Description", spec.description)
     _sub(registration, "Author", "Majordomo")
 
+    user = current_user()
+
     triggers = _sub(task, "Triggers")
     if spec.kind == "logon":
         trigger = _sub(triggers, "LogonTrigger")
         _sub(trigger, "Enabled", "true")
-    elif spec.kind == "boot":
-        trigger = _sub(triggers, "BootTrigger")
-        _sub(trigger, "Enabled", "true")
-        # The desktop is not ready the instant the boot trigger fires.
-        _sub(trigger, "Delay", "PT1M")
+        # Scope to this user. Without it the trigger covers every account on
+        # the machine, which needs administrator rights to register.
+        _sub(trigger, "UserId", user)
+        # The desktop is not usable the instant you log in.
+        _sub(trigger, "Delay", "PT30S")
     else:
         trigger = _sub(triggers, "EventTrigger")
         _sub(trigger, "Enabled", "true")
@@ -93,6 +126,7 @@ def build_task_xml(spec: TaskSpec, command: str, arguments: str) -> str:
 
     principals = _sub(task, "Principals")
     principal = ET.SubElement(principals, "Principal", {"id": "Author"})
+    _sub(principal, "UserId", user)
     _sub(principal, "LogonType", "InteractiveToken")
     _sub(principal, "RunLevel", "LeastPrivilege")
 
@@ -114,6 +148,12 @@ def build_task_xml(spec: TaskSpec, command: str, arguments: str) -> str:
     action = _sub(actions, "Exec")
     _sub(action, "Command", command)
     _sub(action, "Arguments", arguments)
+
+    # Deliberately no PYTHONUTF8 wrapper here. Forcing it would mean running via
+    # `cmd /c`, which flashes a console window on every wake — exactly what
+    # pythonw.exe is chosen to avoid. It is also unnecessary: under pythonw
+    # there is no console to encode *to*, and `safe_print` handles the
+    # interactive cp1252 case where the problem actually exists.
 
     return '<?xml version="1.0" encoding="UTF-16"?>\n' + ET.tostring(task, encoding="unicode")
 
@@ -140,6 +180,12 @@ def install(python: str | None = None) -> list[str]:
     arguments = BRIEF_ARGUMENTS
 
     registered: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    # Retire anything an older version left behind before adding the new set.
+    for name in LEGACY_TASK_NAMES:
+        _run_schtasks(["/Delete", "/TN", name, "/F"])
+
     for spec in TASKS:
         xml = build_task_xml(spec, windowless, arguments)
         # schtasks /XML insists on reading from a file, and on UTF-16.
@@ -150,13 +196,23 @@ def install(python: str | None = None) -> list[str]:
             temp = fh.name
         try:
             result = _run_schtasks(["/Create", "/TN", spec.name, "/XML", temp, "/F"])
-            if result.returncode != 0:
-                raise TriggerError(
-                    f"registering {spec.name} failed: {result.stderr.strip() or result.stdout.strip()}"
-                )
-            registered.append(spec.name)
+            if result.returncode == 0:
+                registered.append(spec.name)
+            else:
+                failed.append((spec.name, (result.stderr or result.stdout).strip()))
         finally:
             Path(temp).unlink(missing_ok=True)
+
+    # Report per task rather than aborting on the first failure. Raising after
+    # one refusal meant a single unregisterable trigger left you with *nothing*
+    # installed, when the others were perfectly fine.
+    if failed and not registered:
+        detail = "; ".join(f"{name}: {err}" for name, err in failed)
+        raise TriggerError(detail)
+
+    if failed:
+        for name, err in failed:
+            print(f"warning: could not register {name}: {err}", file=sys.stderr)
 
     return registered
 
@@ -164,8 +220,10 @@ def install(python: str | None = None) -> list[str]:
 def uninstall() -> int:
     """Remove every task we registered. Returns how many were removed."""
     removed = 0
-    for spec in TASKS:
-        result = _run_schtasks(["/Delete", "/TN", spec.name, "/F"])
+    # Legacy names included, or a task this version stopped creating could never
+    # be uninstalled by the version that stopped creating it.
+    for name in [spec.name for spec in TASKS] + LEGACY_TASK_NAMES:
+        result = _run_schtasks(["/Delete", "/TN", name, "/F"])
         if result.returncode == 0:
             removed += 1
     return removed

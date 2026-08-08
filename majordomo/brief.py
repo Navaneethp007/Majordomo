@@ -18,7 +18,7 @@ from pathlib import Path
 from majordomo import coordinator, state
 from majordomo.config import Config
 from majordomo.models import Briefing, SourceReport
-from majordomo.workers import github, sessions
+from majordomo.workers import github, gmail, sessions
 
 
 @dataclass
@@ -46,6 +46,8 @@ def gather(config: Config, state_file: Path | str | None = None) -> list[SourceR
         tasks.append(("sessions", lambda: sessions.run(config, state_file)))
     if config.sources.github.enabled:
         tasks.append(("github", lambda: github.run(config)))
+    if config.sources.gmail.enabled:
+        tasks.append(("gmail", lambda: gmail.run(config)))
 
     if not tasks:
         return []

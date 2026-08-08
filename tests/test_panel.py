@@ -236,3 +236,26 @@ def test_the_page_renders_errors_rather_than_hanging(server):
     """The client half: without this the page shows 'Loading…' forever."""
     _, body = get(server.url)
     assert "res.ok" in body and "Briefing failed" in body
+
+
+def test_context_items_are_served_and_rendered(server, monkeypatch):
+    from majordomo.models import ContextItem
+
+    mail = ContextItem(kind="unread_mail", title="Priya: Invoice rounding",
+                       detail="Unread.", source="gmail",
+                       action="https://mail.google.com/mail/u/0/#inbox/19fe079e910878d8")
+    monkeypatch.setattr(
+        brief, "run",
+        lambda c, s=None: brief.BriefResult(briefing=Briefing("Quiet.", [], [mail])),
+    )
+    port = server.server.server_address[1]
+
+    _, body = get(f"http://127.0.0.1:{port}/api/brief?t={token_of(server)}")
+    payload = json.loads(body)
+
+    assert payload["context"][0]["action"].startswith("https://mail.google.com/")
+    assert payload["needs_you"] == [], "mail must never appear under Needs you"
+
+    _, page = get(server.url)
+    assert "context-heading" in page
+    assert "Also waiting" in page

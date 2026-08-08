@@ -255,3 +255,19 @@ def test_errors_never_touch_the_real_home(monkeypatch, tmp_path):
     written = paths.error_log_path()
     assert written.is_file()
     assert str(written).startswith(os.environ["MAJORDOMO_HOME"])
+
+
+def test_stop_records_a_heartbeat(monkeypatch, tmp_path):
+    events = run(monkeypatch, tmp_path, "Stop", payload={"last_assistant_message": "done"})
+    assert len(events) == 1
+    assert events[0].kind == "Stop"
+    assert events[0].status == "active"
+
+
+def test_every_event_records_which_hook_wrote_it(monkeypatch, tmp_path):
+    """SessionStart and UserPromptSubmit both write 'active', so without `kind`
+    the log cannot be read back to tell what actually happened."""
+    for hook_event, matcher in [("SessionStart", "startup"), ("UserPromptSubmit", None),
+                                ("Stop", None), ("SessionEnd", None)]:
+        events = run(monkeypatch, tmp_path / hook_event, hook_event, matcher)
+        assert events[0].kind == hook_event

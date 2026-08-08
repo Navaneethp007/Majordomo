@@ -294,3 +294,207 @@ def test_null_content_does_not_crash_the_escalated_path(monkeypatch):
     routed = coordinator.route_report(report(summary="x " * 400), make_config(threshold=10))
 
     assert routed.ok
+
+
+# ---------------------------------------------------------------------------
+# Grounding — the fuser must not invent obligations
+# ---------------------------------------------------------------------------
+
+def test_fuse_prompt_carries_the_needs_you_list(monkeypatch):
+    """The original bug: needs_you was computed and then never shown to the
+    model writing the briefing, so it re-derived actionability from prose and
+    got it wrong."""
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+    item = NeedsYouItem(
+        kind="review_request", title="majordomo#12",
+        detail="Your review is requested.", source="github",
+    )
+
+    coordinator.fuse([report(items=[item])], make_config())
+
+    prompt = str(recorder.calls[0]["messages"])
+    assert "majordomo#12" in prompt
+    assert "Your review is requested." in prompt
+    assert "DECISIONS" in prompt
+
+
+def test_fuse_prompt_states_plainly_when_nothing_needs_you(monkeypatch):
+    """With an empty list the model announced three obligations. It must be told
+    the list is empty AND complete, or it pads the silence with fiction."""
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+
+    coordinator.fuse([report(items=[])], make_config())
+
+    prompt = str(recorder.calls[0]["messages"])
+    assert "(nothing)" in prompt
+    assert "Do NOT invent tasks" in prompt
+
+
+def test_fuse_prompt_separates_decisions_from_context(monkeypatch):
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+
+    coordinator.fuse([report(summary="some background")], make_config())
+
+    prompt = str(recorder.calls[0]["messages"])
+    assert prompt.index("DECISIONS") < prompt.index("CONTEXT (background only)")
+    assert "background only" in prompt
+
+
+def test_fuse_prompt_warns_about_the_two_specific_misreads(monkeypatch):
+    """Both of these produced real fabrications: an active session's topic read
+    as a decision, and a participating notification read as a review request."""
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+
+    coordinator.fuse([report()], make_config())
+    prompt = str(recorder.calls[0]["messages"])
+
+    assert "still working needs nothing" in prompt
+    assert "not a review request" in prompt
+
+
+def test_fuse_prompt_stays_silent_about_healthy_sources(monkeypatch):
+    """'No sources were unavailable' was padding — the model inverting a
+    conditional instruction. Don't give it the conditional when it doesn't apply."""
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+
+    coordinator.fuse([report(ok=True)], make_config())
+
+    assert "could not be reached" not in str(recorder.calls[0]["messages"])
+
+
+def test_fuse_prompt_names_an_unavailable_source(monkeypatch):
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+
+    coordinator.fuse([SourceReport.failed("github", "401")], make_config())
+
+    prompt = str(recorder.calls[0]["messages"])
+    assert "could not be reached" in prompt
+    assert "github" in prompt
+
+
+def test_pre_summarised_source_skips_the_model(monkeypatch):
+    """The sessions worker writes prose deterministically. Re-summarising it
+    cost a call and destroyed the detail — 'two sessions, one on the payments[]
+    question' came back as 'You were reviewing GitHub'."""
+    def boom(*a, **k):
+        raise AssertionError("a pre-summarised source must not be sent to the model")
+
+    monkeypatch.setattr(coordinator, "complete", boom)
+    r = SourceReport(
+        source="sessions", ok=True,
+        summary="NO ACTION NEEDED — 2 running: fe-raad-erp (vscode) — payments[] shape",
+        pre_summarised=True,
+    )
+
+    routed = coordinator.route_report(r, make_config())
+
+    assert routed.summary == r.summary, "the detail must survive verbatim"
+    assert "no model call" in routed.route_reason
+
+
+def test_pre_summarised_source_still_escalates_when_huge(monkeypatch):
+    """Skipping the cheap call must not disable size escalation — a genuinely
+    enormous payload still needs reducing."""
+    recorder = RoleRecorder([])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+    monkeypatch.setattr(coordinator, "CHUNK_CHARS", 500)
+
+    big = "\n".join(f"  - session {i:03d} doing something" for i in range(60))
+    routed = coordinator.route_report(
+        SourceReport("sessions", True, big, pre_summarised=True), make_config(threshold=10)
+    )
+
+    assert routed.path == "escalated"
+    assert recorder.reduce_calls > 1
+
+
+# ---------------------------------------------------------------------------
+# Context items must never become decisions
+# ---------------------------------------------------------------------------
+
+def test_context_items_never_reach_the_decisions_block(monkeypatch):
+    """Gmail is a digest. If its items could land in DECISIONS, the briefing
+    would start asserting that you must read your email."""
+    from majordomo.models import ContextItem
+
+    recorder = Recorder(["briefing"])
+    monkeypatch.setattr(coordinator, "complete", recorder)
+    mail = ContextItem(kind="unread_mail", title="Priya: Invoice rounding",
+                       detail="Unread.", source="gmail")
+
+    coordinator.fuse(
+        [SourceReport("gmail", True, "NO ACTION NEEDED — 1 unread", context_items=[mail])],
+        make_config(),
+    )
+
+    prompt = str(recorder.calls[0]["messages"])
+    # Split on the block header, not the word — "DECISIONS" also appears in the
+    # instructions above it.
+    decisions = prompt.split("DECISIONS (complete list")[1].split("CONTEXT (background only)")[0]
+    assert "(nothing)" in decisions
+    assert "Invoice rounding" not in decisions
+    # ...and the mail is still present as background.
+    assert "1 unread" in prompt.split("CONTEXT (background only)")[1]
+
+
+def test_context_items_survive_routing(monkeypatch):
+    from majordomo.models import ContextItem
+
+    monkeypatch.setattr(coordinator, "complete", Recorder(["x"]))
+    mail = ContextItem(kind="unread_mail", title="t", detail="d", source="gmail")
+
+    routed = coordinator.route_report(
+        SourceReport("gmail", True, "digest", context_items=[mail], pre_summarised=True),
+        make_config(),
+    )
+    assert routed.context_items == [mail]
+
+
+def test_fuse_collects_context_from_every_source(monkeypatch):
+    from majordomo.models import ContextItem
+
+    monkeypatch.setattr(coordinator, "complete", Recorder(["briefing"]))
+    a = ContextItem(kind="unread_mail", title="a", detail="", source="gmail")
+
+    briefing = coordinator.fuse(
+        [report(), SourceReport("gmail", True, "digest", context_items=[a])], make_config()
+    )
+    assert briefing.context == [a]
+
+
+def test_context_items_survive_every_routing_path(monkeypatch):
+    """Only the pre_summarised branch carried them. Lowering the router
+    threshold — which the config comment invites — silently emptied the mail
+    list from both the CLI and the panel, with no error anywhere."""
+    from majordomo.models import ContextItem
+
+    mail = ContextItem(kind="unread_mail", title="Priya: Invoice", detail="d", source="gmail")
+
+    def source(**kw):
+        return SourceReport("gmail", True, "a digest line\nanother line",
+                            context_items=[mail], **kw)
+
+    # cheap summarize
+    monkeypatch.setattr(coordinator, "complete", Recorder(["summary"]))
+    assert coordinator.route_report(source(), make_config()).context_items == [mail]
+
+    # escalated
+    monkeypatch.setattr(coordinator, "complete", RoleRecorder([]))
+    monkeypatch.setattr(coordinator, "CHUNK_CHARS", 20)
+    assert coordinator.route_report(source(), make_config(threshold=1)).context_items == [mail]
+
+    # LLM failure fallback
+    monkeypatch.setattr(coordinator, "complete", Recorder([LLMError("503")]))
+    assert coordinator.route_report(source(), make_config()).context_items == [mail]
+
+    # pre-summarised
+    monkeypatch.setattr(coordinator, "complete", Recorder(["x"]))
+    assert coordinator.route_report(
+        source(pre_summarised=True), make_config()
+    ).context_items == [mail]

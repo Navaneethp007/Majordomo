@@ -114,8 +114,23 @@ def route_report(report: SourceReport, config: Config) -> SourceReport:
                 ok=True,
                 summary=summary or report.summary,
                 items=report.items,
+                context_items=report.context_items,
                 path="escalated",
                 route_reason=reason,
+            )
+
+        if report.pre_summarised:
+            # Already human-readable. A model pass here is a call spent to lose
+            # information — nothing to gain when the worker wrote prose on purpose.
+            return SourceReport(
+                source=report.source,
+                ok=True,
+                summary=report.summary,
+                items=report.items,
+                context_items=report.context_items,
+                path="cheap",
+                route_reason="already summarised by its worker; no model call",
+                pre_summarised=True,
             )
 
         summary = summarize_source(report, config)
@@ -124,6 +139,7 @@ def route_report(report: SourceReport, config: Config) -> SourceReport:
             ok=True,
             summary=summary or report.summary,
             items=report.items,
+            context_items=report.context_items,
             path="cheap",
             route_reason=decision.reason,
         )
@@ -142,6 +158,7 @@ def route_report(report: SourceReport, config: Config) -> SourceReport:
             ok=True,
             summary=raw[:2_000] + ("… (truncated)" if truncated else ""),
             items=report.items,
+            context_items=report.context_items,
             path="error",
             route_reason=f"model failed ({exc}); fell back to raw text"
             + (" and truncated it" if truncated else ""),
@@ -160,6 +177,7 @@ def _raw_briefing(reports: list[SourceReport]) -> str:
 def fuse(reports: list[SourceReport], config: Config) -> Briefing:
     """Fuse every source into one briefing. Never raises on a model failure."""
     needs_you: list[NeedsYouItem] = [item for report in reports for item in report.items]
+    context = [item for report in reports for item in report.context_items]
 
     if not reports:
         return Briefing(briefing_text="Nothing to report.", needs_you=[])
@@ -181,6 +199,10 @@ def fuse(reports: list[SourceReport], config: Config) -> Briefing:
     except (LLMError, MissingApiKey):
         # The Voicelog degradation pattern: you still get the information, just
         # unfused. This is the whole reason the raw summaries are kept around.
-        return Briefing(briefing_text=_raw_briefing(reports), needs_you=needs_you)
+        return Briefing(
+            briefing_text=_raw_briefing(reports), needs_you=needs_you, context=context
+        )
 
-    return Briefing(briefing_text=text or _raw_briefing(reports), needs_you=needs_you)
+    return Briefing(
+        briefing_text=text or _raw_briefing(reports), needs_you=needs_you, context=context
+    )

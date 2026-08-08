@@ -34,9 +34,15 @@ class SettingsUnreadable(Exception):
 #: started". Notification is listed twice because its payload carries only
 #: ``message`` — it never says which matcher matched, so the matcher has to
 #: travel in our own argv.
+#: Stop is a *heartbeat*, not a state change. SessionEnd cannot run when the
+#: process is killed rather than closed — a VS Code window that crashes, a
+#: terminal closed with the X — so a session could sit at "active" forever with
+#: nothing to contradict it. Stop fires at the end of every assistant turn, which
+#: gives liveness a positive signal instead of inferring it from silence.
 HOOK_SPECS: list[tuple[str, str | None]] = [
     ("SessionStart", "startup|resume"),
     ("UserPromptSubmit", None),
+    ("Stop", None),
     ("Notification", "idle_prompt"),
     ("Notification", "permission_prompt"),
     ("SessionEnd", None),

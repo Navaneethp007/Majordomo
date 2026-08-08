@@ -95,6 +95,11 @@ def status_for(event: str, matcher: str | None) -> SessionStatus | None:
         # A prompt was submitted, so the session is working again — this both
         # clears a previous idle/blocked state and carries the new topic.
         return "active"
+    if event == "Stop":
+        # Heartbeat only. The assistant finished a turn, which proves the
+        # session is alive — but it must not overwrite a blocked or idle
+        # status, so `fold` handles it specially via the `kind` field.
+        return "active"
     if event == "SessionEnd":
         return "ended"
     if event == "Notification":
@@ -136,6 +141,7 @@ def event_from_payload(
         at=stamp,
         topic=topic,
         entrypoint=entrypoint,
+        kind=event,
     )
 
 

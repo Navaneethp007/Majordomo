@@ -19,7 +19,7 @@ def test_load_missing_default_path_uses_defaults(tmp_path, monkeypatch):
 
     assert isinstance(cfg, Config)
     assert cfg.brain.provider == "openrouter"
-    assert cfg.voice.provider == "elevenlabs"
+    assert cfg.voice.provider == "nvidia"
     assert cfg.router.size_threshold_tokens > 0
     assert cfg.sources.github.enabled is True
 
@@ -120,7 +120,7 @@ def test_empty_section_does_not_crash(tmp_path):
     cfg = config_module.load(str(path))
 
     assert cfg.brain.provider == "openrouter"
-    assert cfg.voice.provider == "elevenlabs"
+    assert cfg.voice.provider == "nvidia"
     assert cfg.router.size_threshold_tokens > 0
     assert cfg.sources.github.enabled is True
 

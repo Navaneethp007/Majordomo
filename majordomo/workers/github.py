@@ -134,17 +134,33 @@ def _pr_line(pr: dict) -> str:
 
 
 def to_text(raw: dict[str, list]) -> str:
-    """Flatten the payload to the text the router sizes and the model reads."""
+    """Flatten the payload to the text the router sizes and the model reads.
+
+    Every section says whether it is actionable, because the labels alone were
+    not enough. "Unread notifications you're participating in" became "you need
+    to review these pull requests" in the briefing — on a morning with *zero*
+    review requests. A notification about a PR you commented on is not a request
+    for your review, and neither is a PR you opened yourself.
+    """
     lines: list[str] = []
 
     if raw["review_requests"]:
-        lines.append("PRs awaiting your review:")
+        lines.append("NEEDS ACTION — your review has been formally requested on:")
         lines += [f"  - {_pr_line(pr)}" for pr in raw["review_requests"]]
+    else:
+        lines.append("NEEDS ACTION — no reviews have been requested from you.")
+
     if raw["my_prs"]:
-        lines.append("Your open PRs:")
+        lines.append(
+            "NO ACTION NEEDED — pull requests you opened yourself (yours, not to review):"
+        )
         lines += [f"  - {_pr_line(pr)}" for pr in raw["my_prs"]]
+
     if raw["notifications"]:
-        lines.append("Unread notifications you're participating in:")
+        lines.append(
+            "NO ACTION NEEDED — threads you are subscribed to; these are activity "
+            "notifications, NOT review requests:"
+        )
         for note in raw["notifications"]:
             subject = note.get("subject") or {}
             repo = (note.get("repository") or {}).get("full_name", "?")
@@ -183,8 +199,9 @@ def run(config: Config, token: str | None = None) -> SourceReport:
     except Exception as exc:
         return SourceReport.failed(NAME, f"unexpected: {exc}")
 
-    text = to_text(raw)
-    if not text:
+    # Key off the data, not the rendered text: to_text always emits at least
+    # the "no reviews requested" line now, so it is never falsy.
+    if not any(raw.values()):
         return SourceReport(
             source=NAME,
             ok=True,
@@ -193,6 +210,8 @@ def run(config: Config, token: str | None = None) -> SourceReport:
             path="cheap",
             route_reason="empty payload",
         )
+
+    text = to_text(raw)
 
     # The report leaves here *unreasoned*: the router decides whether this goes
     # through a cheap summarize or an escalated reducer, and does that for every

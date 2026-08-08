@@ -120,7 +120,7 @@ def test_install_backs_up_first(settings):
 # Does it actually install
 # ---------------------------------------------------------------------------
 
-def test_all_five_handlers_are_added(settings):
+def test_all_handlers_are_added(settings):
     install.install(settings_path=settings, cli_path=CLI)
     after = read(settings)
 
@@ -135,6 +135,7 @@ def test_all_five_handlers_are_added(settings):
     assert installed == {
         ("SessionStart", "startup|resume"),
         ("UserPromptSubmit", None),
+        ("Stop", None),
         ("Notification", "idle_prompt"),
         ("Notification", "permission_prompt"),
         ("SessionEnd", None),
@@ -191,7 +192,7 @@ def test_reinstall_upgrades_a_moved_path(settings):
         for h in group["hooks"]
         if install._is_ours(h)
     ]
-    assert len(ours) == 5, "the stale handlers were stacked instead of replaced"
+    assert len(ours) == len(install.HOOK_SPECS), "stale handlers were stacked"
     assert all("c:/old/location" not in " ".join(h["args"]) for h in ours)
 
 
@@ -202,7 +203,7 @@ def test_install_into_absent_settings_file(tmp_path, monkeypatch):
     result = install.install(settings_path=path, cli_path=CLI)
 
     assert result.backup is None
-    assert len(read(path)["hooks"]) == 4  # SessionStart, UserPromptSubmit, Notification, SessionEnd
+    assert set(read(path)["hooks"]) == {e for e, _ in install.HOOK_SPECS}
 
 
 def test_malformed_settings_refuses_rather_than_overwrites(settings):

@@ -177,8 +177,82 @@ def _synth_elevenlabs(chunks: list[str], api_key: str, cfg: VoiceConfig) -> tupl
     return bytes(pcm), 24000
 
 
-#: Adding Fish Audio or a local engine later is one function and one entry here.
+def _import_riva():
+    """Import riva.client and AudioEncoding. Kept thin so tests can patch it."""
+    import riva.client
+    from riva.client.proto.riva_audio_pb2 import AudioEncoding
+
+    return riva.client, AudioEncoding
+
+
+def _synth_nvidia(chunks: list[str], api_key: str, cfg: VoiceConfig) -> tuple[bytes, int]:
+    """NVIDIA Riva TTS over NVCF gRPC.
+
+    Ported from Voicelog, where this has been the default engine for a while.
+    Unlike the HTTP providers it speaks gRPC, which is why ``nvidia-riva-client``
+    is an optional extra rather than a hard dependency — a text-only install
+    should not pull in grpc.
+
+    The async future path is deliberate: Riva's synchronous ``synthesize()`` has
+    no timeout and can block forever, which in a wake-time briefing would mean a
+    scheduled task hanging silently until Windows kills it.
+    """
+    try:
+        riva_client, AudioEncoding = _import_riva()
+    except ImportError as exc:
+        raise TTSError(
+            "NVIDIA Riva TTS not installed — run: pip install majordomo[nvidia]"
+        ) from exc
+
+    import grpc  # available whenever riva.client imported
+
+    if not cfg.function_id:
+        raise TTSError("NVIDIA Riva needs voice.function_id set to an NVCF function id")
+
+    rate = cfg.sample_rate
+    try:
+        auth = riva_client.Auth(
+            uri="grpc.nvcf.nvidia.com:443",
+            use_ssl=True,
+            metadata_args=[
+                ["function-id", cfg.function_id],
+                ["authorization", f"Bearer {api_key}"],
+            ],
+        )
+        service = riva_client.SpeechSynthesisService(auth)
+
+        pcm = bytearray()
+        for piece in chunks:
+            call = service.synthesize(
+                piece,
+                voice_name=cfg.voice_id,
+                language_code=cfg.language,
+                sample_rate_hz=rate,
+                encoding=AudioEncoding.LINEAR_PCM,
+                future=True,
+            )
+            try:
+                response = call.result(timeout=cfg.timeout)
+            except grpc.FutureTimeoutError as exc:
+                call.cancel()
+                raise TTSError(
+                    f"speech synthesis timed out after {cfg.timeout:.0f}s — the TTS "
+                    f"service was too slow. Try again, raise voice.timeout, or use "
+                    f"--no-speak."
+                ) from exc
+            pcm.extend(response.audio)
+    except TTSError:
+        raise
+    except Exception as exc:
+        raise TTSError(str(exc)) from exc
+
+    return bytes(pcm), rate
+
+
+#: Adding a local engine later is one function and one entry here.
 ADAPTERS = {
+    "nvidia": _synth_nvidia,
+    "riva": _synth_nvidia,  # alias — Voicelog calls this engine "riva"
     "elevenlabs": _synth_elevenlabs,
 }
 

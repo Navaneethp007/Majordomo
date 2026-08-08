@@ -10,6 +10,7 @@ and a chance to be wrong.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,23 +32,50 @@ def _parse_at(value: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def fold(events: list, now: datetime | None = None, stale_after_hours: int = 72) -> list[Session]:
+def fold(
+    events: list,
+    now: datetime | None = None,
+    stale_after_hours: int = 72,
+    active_timeout_minutes: int = 90,
+) -> list[Session]:
     """Collapse the event log into each session's current state.
 
     The log is append-only, so a session's state is the *last* event about it —
     except for ``topic``, which is carried forward: a `UserPromptSubmit` sets it
     and the later idle/blocked events don't repeat it.
 
-    Ended sessions are dropped (there is nothing to tell you about them), as are
-    sessions whose last event is older than ``stale_after_hours`` — a machine
-    that slept for a week should not brief you about last Tuesday's terminal.
+    **Liveness is not the same as not-having-ended.** ``SessionEnd`` cannot run
+    if the process is killed — a crashed VS Code window, a terminal closed with
+    the X — so treating ``ended`` as the only exit left dead sessions listed as
+    "active" for days. Two things fix that:
+
+    - ``Stop`` fires at the end of every assistant turn, which both proves the
+      session is alive **and** proves it is not blocked. A permission prompt
+      happens *mid*-turn, so the turn cannot end while one is outstanding —
+      a Stop after a block means you answered it.
+    - An ``active`` session with no event for ``active_timeout_minutes`` is
+      presumed gone. Nothing is claiming it is alive, so we stop claiming it.
+
+    An earlier version treated Stop as a status-preserving heartbeat, on the
+    theory that it should not clear a block. That was exactly backwards, and it
+    was the worse failure: approving a prompt emits no ``UserPromptSubmit``, so
+    the session stayed ``blocked`` forever — while every subsequent turn
+    refreshed ``at`` and kept the staleness sweep from ever retiring it. The
+    briefing then asserted a blocking obligation that had been resolved hours
+    earlier, every single time it ran.
+
+    ``blocked`` and ``idle_awaiting_you`` deliberately keep the much longer
+    ``stale_after_hours`` window: those are genuinely waiting on you, and going
+    quiet is exactly what they are supposed to do.
     """
     moment = now or datetime.now(timezone.utc)
-    cutoff = moment - timedelta(hours=stale_after_hours)
+    stale_cutoff = moment - timedelta(hours=stale_after_hours)
+    active_cutoff = moment - timedelta(minutes=active_timeout_minutes)
 
     latest: dict[str, Session] = {}
     for event in events:
         previous = latest.get(event.session_id)
+
         latest[event.session_id] = Session(
             session_id=event.session_id,
             surface=event.surface,
@@ -63,8 +91,11 @@ def fold(events: list, now: datetime | None = None, stale_after_hours: int = 72)
         if session.status == "ended":
             continue
         stamp = _parse_at(session.at)
-        if stamp is not None and stamp < cutoff:
-            continue
+        if stamp is not None:
+            if stamp < stale_cutoff:
+                continue
+            if session.status == "active" and stamp < active_cutoff:
+                continue  # nothing has claimed it is alive for a long time
         live.append(session)
 
     live.sort(key=lambda s: (_ATTENTION_ORDER.get(s.status, 9), s.at))
@@ -78,7 +109,14 @@ def describe(session: Session) -> str:
 
 
 def summarise(sessions: list[Session]) -> str:
-    """A plain-language line the coordinator can fuse. No model needed."""
+    """A plain-language line the coordinator can fuse. No model needed.
+
+    Each group states its own actionability inline. Without that, "2 sessions
+    still working: fe-raad-erp — what does one payments[] element look like on
+    the wire?" reads to a model exactly like an open question addressed to the
+    user, and it duly reported it as a decision awaiting them. It is the
+    opposite: a question they asked, already being worked on.
+    """
     if not sessions:
         return "No live coding sessions."
 
@@ -89,16 +127,21 @@ def summarise(sessions: list[Session]) -> str:
     parts = []
     if blocked:
         parts.append(
-            f"{len(blocked)} session(s) blocked waiting for your approval: "
+            f"NEEDS ACTION — {len(blocked)} session(s) stopped at a permission prompt "
+            "and cannot continue until approved: "
             + "; ".join(describe(s) for s in blocked)
         )
     if idle:
         parts.append(
-            f"{len(idle)} session(s) finished and waiting on you: "
-            + "; ".join(describe(s) for s in idle)
+            f"NEEDS ACTION — {len(idle)} session(s) finished and are waiting for the "
+            "next instruction: " + "; ".join(describe(s) for s in idle)
         )
     if active:
-        parts.append(f"{len(active)} session(s) still working: " + "; ".join(describe(s) for s in active))
+        parts.append(
+            f"NO ACTION NEEDED — {len(active)} session(s) currently running; the topic "
+            "shown is what the user asked, not a question for them: "
+            + "; ".join(describe(s) for s in active)
+        )
     return ". ".join(parts) + "."
 
 
@@ -119,6 +162,7 @@ def run(
             events,
             now=now,
             stale_after_hours=config.sources.sessions.stale_after_hours,
+            active_timeout_minutes=config.sources.sessions.active_timeout_minutes,
         )
 
         items = [
@@ -144,6 +188,10 @@ def run(
             items=items,
             path="cheap",
             route_reason="local read, no model needed",
+            # summarise() already writes for a human. Sending it through the
+            # cheap summarize call spent a request and lost the detail that
+            # makes it useful — which repo, which topic.
+            pre_summarised=True,
         )
     except Exception as exc:  # pragma: no cover - defensive; state.py doesn't raise
         return SourceReport.failed(NAME, str(exc))

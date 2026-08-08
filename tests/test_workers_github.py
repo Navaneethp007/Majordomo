@@ -182,8 +182,11 @@ def test_to_text_names_repo_and_number():
     assert "Add the escalation gate" in text
 
 
-def test_to_text_empty_payload_is_empty_string():
-    assert github.to_text({"review_requests": [], "my_prs": [], "notifications": []}) == ""
+def test_to_text_on_an_empty_payload_still_states_no_reviews():
+    """Deliberately not empty any more. Saying nothing about review requests is
+    what let the model infer them from notification titles."""
+    text = github.to_text({"review_requests": [], "my_prs": [], "notifications": []})
+    assert "no reviews have been requested from you" in text
 
 
 def test_review_requests_become_needs_you_items():
@@ -298,3 +301,45 @@ def test_gh_not_on_path_returns_none_without_running_anything(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", boom)
     assert github.token_from_gh() is None
+
+
+# ---------------------------------------------------------------------------
+# Actionability markers — the labels alone were not enough
+# ---------------------------------------------------------------------------
+
+def test_review_requests_are_marked_as_needing_action():
+    text = github.to_text(
+        {"review_requests": SEARCH_REVIEWS["items"], "my_prs": [], "notifications": []}
+    )
+    assert "NEEDS ACTION" in text
+    assert "review has been formally requested" in text
+
+
+def test_no_review_requests_is_stated_explicitly():
+    """Silence let the model fill the gap from notification titles."""
+    text = github.to_text({"review_requests": [], "my_prs": [], "notifications": NOTIFICATIONS})
+    assert "no reviews have been requested from you" in text
+
+
+def test_your_own_prs_are_marked_no_action():
+    text = github.to_text({"review_requests": [], "my_prs": SEARCH_MINE["items"], "notifications": []})
+    assert "NO ACTION NEEDED" in text
+    assert "yours, not to review" in text
+
+
+def test_notifications_say_they_are_not_review_requests():
+    """This exact confusion produced 'You also need to review pull requests for
+    Raad-ERP' on a morning with zero review requests."""
+    text = github.to_text({"review_requests": [], "my_prs": [], "notifications": NOTIFICATIONS})
+    assert "NOT review requests" in text
+
+
+def test_genuinely_empty_payload_still_short_circuits(monkeypatch):
+    """to_text is never falsy now, so run() must key off the data instead."""
+    FakeClient, _ = fake_client([{"items": []}, {"items": []}, []])
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    report = github.run(CFG, token="tok")
+
+    assert report.ok
+    assert "Nothing waiting" in report.summary

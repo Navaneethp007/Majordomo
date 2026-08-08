@@ -58,6 +58,8 @@ PAGE = """<!doctype html>
           border-radius:7px; border:1px solid var(--line); background:transparent;
           color:var(--fg); text-decoration:none; white-space:nowrap; }
   button:hover { border-color:var(--muted); }
+  .item.context { background:transparent; border-style:dashed; }
+  .item.context .title { font-weight:400; }
   .empty { color:var(--muted); }
   footer { margin-top:2.5rem; color:var(--muted); font-size:.8125rem; }
 </style>
@@ -66,6 +68,8 @@ PAGE = """<!doctype html>
   <p class="briefing" id="briefing">Loading…</p>
   <h2 id="needs-heading" hidden>Needs you</h2>
   <div id="items"></div>
+  <h2 id="context-heading" hidden>Also waiting &mdash; nothing required</h2>
+  <div id="context"></div>
   <footer><button onclick="load(true)">Re-brief</button></footer>
 </main>
 <script>
@@ -86,6 +90,27 @@ async function load(fresh) {
     return;
   }
   el.textContent = data.briefing_text;
+
+  const context = document.getElementById('context');
+  document.getElementById('context-heading').hidden = (data.context || []).length === 0;
+  context.innerHTML = '';
+  for (const item of data.context || []) {
+    const row = document.createElement('div');
+    row.className = 'item context';
+    const left = document.createElement('div');
+    left.innerHTML = `<div class="title"></div><div class="detail"></div>`;
+    left.querySelector('.title').textContent = item.title;
+    left.querySelector('.detail').textContent = item.detail;
+    row.append(left);
+    if (item.action) {
+      const a = document.createElement('a');
+      a.className = 'btn'; a.href = item.action; a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = 'Open';
+      row.append(a);
+    }
+    context.append(row);
+  }
 
   const items = document.getElementById('items');
   document.getElementById('needs-heading').hidden = data.needs_you.length === 0;
@@ -192,6 +217,16 @@ def _make_handler(config: Config, token: str):
                                 "action": i.action,
                             }
                             for i in result.briefing.needs_you
+                        ],
+                        "context": [
+                            {
+                                "kind": i.kind,
+                                "title": i.title,
+                                "detail": i.detail,
+                                "source": i.source,
+                                "action": i.action,
+                            }
+                            for i in result.briefing.context
                         ],
                     },
                 )
