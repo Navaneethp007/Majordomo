@@ -161,3 +161,19 @@ def test_playback_failure_becomes_ttserror(monkeypatch):
     with mock.patch("majordomo.tts.httpx.post", return_value=response):
         with pytest.raises(TTSError):
             tts.speak("Hello.", CFG)
+
+
+def test_splits_at_the_latest_sentence_boundary():
+    """The original compared a raw rfind index against a split_at that already
+    had len(sep) added, so a later separator could lose to an earlier one and
+    the chunk broke at the wrong sentence."""
+    text = "A" * 100 + ". " + "B" * 10 + "! " + "C" * 400
+    chunks = chunk_text(text, max_len=200)
+
+    assert chunks[0].endswith("!"), f"broke at the wrong boundary: {chunks[0][-5:]!r}"
+
+
+def test_chunking_never_loses_or_duplicates_text():
+    text = ". ".join(f"sentence number {i} here" for i in range(200))
+    chunks = chunk_text(text, max_len=180)
+    assert " ".join(chunks).split() == text.split()

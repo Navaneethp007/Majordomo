@@ -12,7 +12,7 @@ one mockable thing.
 """
 from __future__ import annotations
 
-import json
+import shutil
 import subprocess
 
 import httpx
@@ -32,15 +32,25 @@ class GitHubError(Exception):
 
 
 def token_from_gh() -> str | None:
-    """Ask the `gh` CLI for its token. Returns None if gh is absent or logged out."""
+    """Ask the `gh` CLI for its token. Returns None if gh is absent or logged out.
+
+    Resolved through ``shutil.which`` rather than handed to the OS as a bare
+    name. On Windows a scoop or npm install of gh is a ``.cmd`` shim, which
+    ``subprocess`` will not execute without a shell — that raised OSError, got
+    swallowed to None, and told a perfectly logged-in user to run
+    ``gh auth login``. ``which`` finds the shim by PATHEXT and returns a path
+    that runs directly, so no shell is needed.
+    """
+    executable = shutil.which("gh")
+    if not executable:
+        return None
+
     try:
         result = subprocess.run(
-            ["gh", "auth", "token"],
+            [executable, "auth", "token"],
             capture_output=True,
             text=True,
             timeout=10,
-            # Windows: gh may be a .cmd shim, so let the shell resolve it.
-            shell=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None

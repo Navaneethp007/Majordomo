@@ -268,3 +268,136 @@ def test_cli_import_does_not_drag_in_the_network_stack():
     )
 
     assert out.stdout.strip() == "", f"cli.py now imports: {out.stdout.strip()}"
+
+
+# ---------------------------------------------------------------------------
+# should_speak — the wake trigger's voice policy
+# ---------------------------------------------------------------------------
+
+class _Args:
+    def __init__(self, no_speak=False, speak_if_needed=False):
+        self.no_speak = no_speak
+        self.speak_if_needed = speak_if_needed
+
+
+ITEM = NeedsYouItem(kind="session_blocked", title="t", detail="d", source="sessions")
+
+
+def test_default_always_speaks():
+    """You asked for a briefing at the keyboard; you get one aloud."""
+    assert cli.should_speak(_Args(), CFG, Briefing("quiet", [])) is True
+
+
+def test_no_speak_wins_over_everything():
+    assert cli.should_speak(_Args(no_speak=True), CFG, Briefing("x", [ITEM])) is False
+
+
+def test_speak_if_needed_is_silent_when_nothing_needs_you():
+    """The whole point: no being told 'nothing is happening' out loud."""
+    assert cli.should_speak(_Args(speak_if_needed=True), CFG, Briefing("quiet", [])) is False
+
+
+def test_speak_if_needed_speaks_when_something_does():
+    assert cli.should_speak(_Args(speak_if_needed=True), CFG, Briefing("x", [ITEM])) is True
+
+
+def test_voice_disabled_in_config_silences_everything():
+    data = config_module._deep_merge(config_module.DEFAULTS, {"voice": {"enabled": False}})
+    muted = config_module.build(data)
+    assert cli.should_speak(_Args(), muted, Briefing("x", [ITEM])) is False
+
+
+def test_wake_trigger_uses_the_conditional_flag():
+    """spec §8 says the wake cycle speaks; speaking unconditionally makes it
+    noise. Asserted against the module constant the installer actually uses —
+    passing the string into build_task_xml and checking it came back only
+    proved the XML builder echoes its input, and stayed green if this reverted
+    to --no-speak."""
+    assert "--speak-if-needed" in trigger.BRIEF_ARGUMENTS
+    assert "--no-speak" not in trigger.BRIEF_ARGUMENTS
+    assert trigger.BRIEF_ARGUMENTS.startswith("-m majordomo.cli brief")
+
+
+def test_task_xml_carries_the_real_arguments():
+    xml = trigger.build_task_xml(trigger.TASKS[2], "pythonw.exe", trigger.BRIEF_ARGUMENTS)
+    assert trigger.BRIEF_ARGUMENTS in xml
+
+
+# ---------------------------------------------------------------------------
+# Silence must not be ambiguous, and must not repeat forever
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+T0 = datetime(2026, 8, 8, 9, 0, tzinfo=timezone.utc)
+OK_REPORT = SourceReport("github", True, "all fine")
+DEAD_REPORT = SourceReport.failed("github", "401 token expired")
+
+
+def test_a_failed_source_is_worth_speaking(monkeypatch):
+    """Under pythonw.exe there is no console — sys.stdout is None and prints go
+    nowhere, so audio is the only channel. An expired token producing the same
+    silence as a quiet morning is indistinguishable from 'all clear'."""
+    assert cli.should_speak(
+        _Args(speak_if_needed=True), CFG, Briefing("github is down", []),
+        [DEAD_REPORT], now=T0,
+    ) is True
+
+
+def test_all_healthy_and_nothing_pending_stays_silent(monkeypatch):
+    assert cli.should_speak(
+        _Args(speak_if_needed=True), CFG, Briefing("quiet", []), [OK_REPORT], now=T0,
+    ) is False
+
+
+def test_cold_boot_does_not_speak_twice(monkeypatch):
+    """OnLogon fires at once and OnBoot a minute later; MultipleInstancesPolicy
+    is per-task and cannot dedupe across them."""
+    briefing = Briefing("one blocked session", [ITEM])
+    args = _Args(speak_if_needed=True)
+
+    first = cli.should_speak(args, CFG, briefing, [OK_REPORT], now=T0)
+    second = cli.should_speak(args, CFG, briefing, [OK_REPORT], now=T0 + timedelta(minutes=1))
+
+    assert first is True
+    assert second is False
+
+
+def test_unchanged_situation_stops_repeating(monkeypatch):
+    """Kernel-Power 107 fires on every modern-standby resume. A session blocked
+    since morning must not be read out on every lid open."""
+    briefing = Briefing("still blocked", [ITEM])
+    args = _Args(speak_if_needed=True)
+
+    cli.should_speak(args, CFG, briefing, [OK_REPORT], now=T0)
+    for minutes in (5, 30, 90):
+        assert cli.should_speak(
+            args, CFG, briefing, [OK_REPORT], now=T0 + timedelta(minutes=minutes)
+        ) is False
+
+
+def test_a_new_item_speaks_immediately(monkeypatch):
+    """Cooldown must suppress repetition, never news."""
+    args = _Args(speak_if_needed=True)
+    cli.should_speak(args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0)
+
+    fresh = NeedsYouItem(kind="review_request", title="repo#99", detail="d", source="github")
+    assert cli.should_speak(
+        args, CFG, Briefing("x", [ITEM, fresh]), [OK_REPORT], now=T0 + timedelta(minutes=2)
+    ) is True
+
+
+def test_the_same_situation_speaks_again_after_the_cooldown(monkeypatch):
+    args = _Args(speak_if_needed=True)
+    cli.should_speak(args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0)
+
+    assert cli.should_speak(
+        args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0 + timedelta(hours=3)
+    ) is True
+
+
+def test_manual_brief_ignores_the_gate_entirely():
+    """You typed `mj brief`. You get it aloud, however recently it last spoke."""
+    args = _Args()
+    assert cli.should_speak(args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0) is True
+    assert cli.should_speak(args, CFG, Briefing("x", [ITEM]), [OK_REPORT], now=T0) is True

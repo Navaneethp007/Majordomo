@@ -55,6 +55,11 @@ DEFAULTS: dict[str, Any] = {
         "model": "eleven_multilingual_v2",
         "api_key_env": "ELEVENLABS_API_KEY",
         "timeout": 90.0,
+        # How long an unchanged situation stays quiet under --speak-if-needed.
+        # Without this, every modern-standby resume re-reads the same blocked
+        # session aloud, and a cold boot says everything twice (OnLogon then
+        # OnBoot a minute later).
+        "repeat_after_minutes": 120,
     },
     "sources": {
         "github": {
@@ -111,6 +116,7 @@ class VoiceConfig:
     model: str
     api_key_env: str
     timeout: float
+    repeat_after_minutes: int = 120
 
 
 @dataclass(frozen=True)
@@ -200,12 +206,16 @@ def build(data: dict[str, Any]) -> Config:
     YAML quoting accident ('8000') doesn't produce a str where an int is
     compared.
     """
-    brain = data.get("brain", {})
-    voice = data.get("voice", {})
-    sources = data.get("sources", {})
-    github = sources.get("github", {})
-    sessions = sources.get("sessions", {})
-    router = data.get("router", {})
+    # `or {}` rather than a .get default: a hand-edited config with a bare
+    # `brain:` and nothing indented under it parses to {"brain": None}, and a
+    # default only applies when the key is *absent*. Without this, a plausible
+    # edit gives the user an AttributeError traceback instead of a config.
+    brain = data.get("brain") or {}
+    voice = data.get("voice") or {}
+    sources = data.get("sources") or {}
+    github = sources.get("github") or {}
+    sessions = sources.get("sessions") or {}
+    router = data.get("router") or {}
 
     d_brain = DEFAULTS["brain"]
     d_voice = DEFAULTS["voice"]
@@ -231,6 +241,9 @@ def build(data: dict[str, Any]) -> Config:
             model=str(voice.get("model", d_voice["model"])),
             api_key_env=str(voice.get("api_key_env", d_voice["api_key_env"])),
             timeout=float(voice.get("timeout", d_voice["timeout"])),
+            repeat_after_minutes=int(
+                voice.get("repeat_after_minutes", d_voice["repeat_after_minutes"])
+            ),
         ),
         sources=SourcesConfig(
             github=GitHubConfig(

@@ -20,11 +20,12 @@ import json
 import secrets
 import threading
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from majordomo import brief, resume as resume_mod, state
 from majordomo.config import Config
+from majordomo.llm import MissingApiKey
 from majordomo.workers.sessions import describe, fold
 
 PAGE = """<!doctype html>
@@ -73,8 +74,17 @@ const TOKEN = new URLSearchParams(location.search).get('t');
 async function load(fresh) {
   const el = document.getElementById('briefing');
   if (fresh) el.textContent = 'Briefing…';
-  const res = await fetch(`/api/brief?t=${TOKEN}`);
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch(`/api/brief?t=${TOKEN}`);
+    data = await res.json();
+    // A failed briefing must say so. Leaving the page on "Loading…" forever
+    // was the visible half of the handler dying on MissingApiKey.
+    if (!res.ok) { el.textContent = data.error || `Briefing failed (${res.status}).`; return; }
+  } catch (err) {
+    el.textContent = 'Could not reach Majordomo. Is the tray still running?';
+    return;
+  }
   el.textContent = data.briefing_text;
 
   const items = document.getElementById('items');
@@ -115,7 +125,7 @@ load(false);
 @dataclass
 class PanelHandle:
     url: str
-    server: HTTPServer
+    server: ThreadingHTTPServer
     thread: threading.Thread
 
     def stop(self) -> None:
@@ -157,7 +167,18 @@ def _make_handler(config: Config, token: str):
                 return
 
             if parsed.path == "/api/brief":
-                result = brief.run(config)
+                try:
+                    result = brief.run(config)
+                except MissingApiKey as exc:
+                    # brief.run raises this by contract. Uncaught, the handler
+                    # thread died, the response never arrived, and the page sat
+                    # on "Loading…" forever with nothing to explain why.
+                    self._json(500, {"error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._json(500, {"error": f"briefing failed: {exc}"})
+                    return
+
                 self._json(
                     200,
                     {
@@ -210,9 +231,15 @@ def _make_handler(config: Config, token: str):
 
 
 def serve(config: Config, port: int = 0) -> PanelHandle:
-    """Start the panel on localhost. ``port=0`` picks a free one."""
+    """Start the panel on localhost. ``port=0`` picks a free one.
+
+    Threading, not the plain ``HTTPServer``: ``/api/brief`` runs the entire
+    fetch→route→fuse with a 120-second LLM timeout. On a single-threaded server
+    that held the only request slot for the duration, so clicking Re-brief and
+    then touching anything else hung the tab.
+    """
     token = secrets.token_urlsafe(24)
-    server = HTTPServer(("127.0.0.1", port), _make_handler(config, token))
+    server = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(config, token))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 

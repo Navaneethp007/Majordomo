@@ -137,7 +137,7 @@ def test_run_produces_needs_you_for_blocked_and_idle(tmp_path):
         state.append_event(e, path)
 
     cfg = config_module.build(config_module.DEFAULTS)
-    report = sessions.run(cfg, path)
+    report = sessions.run(cfg, path, now=NOW)
 
     assert report.ok
     kinds = {item.kind for item in report.items}
@@ -152,7 +152,7 @@ def test_run_carries_session_id_as_the_action(tmp_path):
     path = tmp_path / "state.jsonl"
     state.append_event(event("abc123", "blocked"), path)
 
-    report = sessions.run(config_module.build(config_module.DEFAULTS), path)
+    report = sessions.run(config_module.build(config_module.DEFAULTS), path, now=NOW)
 
     assert report.items[0].action == "abc123"
 
@@ -173,3 +173,17 @@ def test_run_makes_no_model_call(tmp_path, monkeypatch):
 
     monkeypatch.setattr(llm, "complete", boom)
     sessions.run(config_module.build(config_module.DEFAULTS), tmp_path / "none.jsonl")
+
+
+def test_staleness_is_measured_against_an_injectable_clock(tmp_path):
+    """Reading the wall clock directly would make a test with a fixed fixture
+    timestamp pass today and fail three days from now — which is exactly what
+    happened before `now` was injectable."""
+    from majordomo import state
+
+    path = tmp_path / "state.jsonl"
+    state.append_event(event("s1", "blocked"), path)
+    cfg = config_module.build(config_module.DEFAULTS)
+
+    assert sessions.run(cfg, path, now=NOW).items          # fresh at NOW
+    assert not sessions.run(cfg, path, now=NOW + timedelta(days=30)).items  # stale later

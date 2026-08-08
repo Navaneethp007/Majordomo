@@ -102,12 +102,22 @@ def summarise(sessions: list[Session]) -> str:
     return ". ".join(parts) + "."
 
 
-def run(config: Config, state_file: Path | str | None = None) -> SourceReport:
-    """Read the log, fold it, report. Never raises."""
+def run(
+    config: Config,
+    state_file: Path | str | None = None,
+    now: datetime | None = None,
+) -> SourceReport:
+    """Read the log, fold it, report. Never raises.
+
+    ``now`` is injectable because staleness is measured against it. Reading the
+    wall clock directly would make every test with a fixed fixture timestamp
+    pass today and fail three days from now.
+    """
     try:
         events = state.read_events(state_file)
         sessions = fold(
             events,
+            now=now,
             stale_after_hours=config.sources.sessions.stale_after_hours,
         )
 

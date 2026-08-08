@@ -267,3 +267,34 @@ def test_run_with_nothing_pending_says_so(monkeypatch):
     assert report.ok
     assert report.items == []
     assert "Nothing waiting" in report.summary
+
+
+# ---------------------------------------------------------------------------
+# gh resolution — a .cmd shim must not read as "not logged in"
+# ---------------------------------------------------------------------------
+
+def test_gh_is_resolved_through_which(monkeypatch):
+    """A scoop/npm install of gh is a .cmd shim, which subprocess will not run
+    without a shell. Passing a bare 'gh' raised OSError, got swallowed to None,
+    and told a logged-in user to run `gh auth login`."""
+    monkeypatch.setattr(github.shutil, "which", lambda name: r"C:\tools\gh.cmd")
+    seen = {}
+
+    def record(argv, **kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="gho_tok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", record)
+
+    assert github.token_from_gh() == "gho_tok"
+    assert seen["argv"][0] == r"C:\tools\gh.cmd", "must invoke the resolved path"
+
+
+def test_gh_not_on_path_returns_none_without_running_anything(monkeypatch):
+    monkeypatch.setattr(github.shutil, "which", lambda name: None)
+
+    def boom(*a, **k):
+        raise AssertionError("must not spawn anything when gh isn't installed")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert github.token_from_gh() is None

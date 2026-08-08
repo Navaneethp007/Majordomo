@@ -67,7 +67,13 @@ def complete(messages: list[dict], brain: BrainConfig, model: str) -> str:
             if not response.is_success:
                 last_exc = Exception(f"HTTP {response.status_code}: {response.text[:300]}")
                 continue
-            return response.json()["choices"][0]["message"]["content"]
+            content = response.json()["choices"][0]["message"]["content"]
+            # Free-tier models return `content: null` on a filtered or empty
+            # completion. Returning that verbatim pushed an AttributeError up
+            # through callers that only guard against LLMError — which meant a
+            # single null answer took down the entire briefing rather than
+            # degrading one source. Normalising here covers every caller at once.
+            return content if isinstance(content, str) else ""
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             # httpx.HTTPError: network/transport failures.
             # ValueError/KeyError/IndexError/TypeError: a 2xx whose body isn't

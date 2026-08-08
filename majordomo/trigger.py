@@ -24,6 +24,15 @@ _NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 
 TASK_PREFIX = "Majordomo"
 
+#: What the scheduled tasks actually run. A module constant rather than a local
+#: inside install(), so a test can assert on it — passing this string *into*
+#: build_task_xml and checking it comes back out only proves the XML builder
+#: echoes its input, and would stay green if this reverted to --no-speak.
+#:
+#: --speak-if-needed, not --no-speak: spec §8 has the wake cycle speak, and the
+#: speech gate stops that becoming noise.
+BRIEF_ARGUMENTS = "-m majordomo.cli brief --speak-if-needed"
+
 #: Kernel-Power 107 is logged when the system resumes from sleep or hibernate.
 WAKE_QUERY = (
     "<QueryList><Query Id='0' Path='System'>"
@@ -128,7 +137,7 @@ def install(python: str | None = None) -> list[str]:
     windowless = command.replace("python.exe", "pythonw.exe")
     if not Path(windowless).is_file():
         windowless = command
-    arguments = "-m majordomo.cli brief --no-speak"
+    arguments = BRIEF_ARGUMENTS
 
     registered: list[str] = []
     for spec in TASKS:

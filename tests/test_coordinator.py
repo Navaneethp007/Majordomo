@@ -265,3 +265,32 @@ def test_empty_model_reply_falls_back(monkeypatch):
     briefing = coordinator.fuse([report(summary="two PRs")], make_config())
 
     assert "two PRs" in briefing.briefing_text
+
+
+# ---------------------------------------------------------------------------
+# Null content — free-tier models return `content: null` on filtered completions
+# ---------------------------------------------------------------------------
+
+def test_null_content_does_not_crash_fuse(monkeypatch):
+    """AttributeError is not LLMError, so a null answer sailed past every
+    `except (LLMError, MissingApiKey)` and took down the whole briefing."""
+    monkeypatch.setattr(coordinator, "complete", Recorder([None]))
+
+    briefing = coordinator.fuse([report(summary="two PRs")], make_config())
+
+    assert "two PRs" in briefing.briefing_text
+
+
+def test_null_content_does_not_crash_the_cheap_path(monkeypatch):
+    monkeypatch.setattr(coordinator, "complete", Recorder([None]))
+    routed = coordinator.route_report(report(summary="raw text"), make_config())
+    assert routed.summary == "raw text"
+
+
+def test_null_content_does_not_crash_the_escalated_path(monkeypatch):
+    monkeypatch.setattr(coordinator, "complete", Recorder([None, None, None, None, None]))
+    monkeypatch.setattr(coordinator, "CHUNK_CHARS", 200)
+
+    routed = coordinator.route_report(report(summary="x " * 400), make_config(threshold=10))
+
+    assert routed.ok

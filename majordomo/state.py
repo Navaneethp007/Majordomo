@@ -17,7 +17,9 @@ editing session.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, get_args
 
@@ -119,3 +121,104 @@ def append_event(event: SessionEvent, path: Path | str | None = None) -> None:
     line = json.dumps(event.to_json(), ensure_ascii=False) + "\n"
     with open(target, "a", encoding="utf-8") as fh:
         fh.write(line)
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+#: Compact once the log passes this. Roughly 10k events — months of use.
+COMPACT_OVER_BYTES = 2_000_000
+
+
+def compact(
+    path: Path | str | None = None,
+    keep_hours: int = 72,
+    now: datetime | None = None,
+) -> int:
+    """Rewrite the log keeping only what can still matter. Returns lines dropped.
+
+    The hook appends on every prompt and nothing ever removed anything, so the
+    file grew without bound — and every ``mj brief``, ``mj sessions`` and panel
+    request JSON-parses the whole thing before ``fold`` throws most of it away.
+    After months that is a multi-megabyte parse on a path that runs at every wake.
+
+    What survives: every event inside ``keep_hours``, plus — for sessions that
+    *do* have recent activity — the newest event older than the cutoff. That
+    last part is why a long-running session keeps its topic: the topic is set
+    once by ``UserPromptSubmit`` and later idle/blocked events don't repeat it,
+    so dropping the old event would leave ``fold`` with nothing to carry.
+
+    Note the direction. Old events belonging to sessions with *no* recent
+    activity are discarded outright: ``fold`` drops those as stale regardless,
+    so keeping them buys nothing and is precisely what makes a log grow forever
+    — one dead session id per terminal you ever opened.
+
+    Deliberately **not** called from the hook. Compaction costs a full read and
+    rewrite, and the hook is the one path that runs on every keystroke-to-prompt.
+    """
+    target = Path(path) if path is not None else state_path()
+    if not target.is_file():
+        return 0
+
+    moment = now or datetime.now(timezone.utc)
+    cutoff = moment - timedelta(hours=keep_hours)
+
+    events = read_events(target)
+    if not events:
+        return 0
+
+    recent: list[SessionEvent] = []
+    newest_older: dict[str, SessionEvent] = {}
+    for event in events:
+        stamp = _parse_at(event.at)
+        if stamp is None or stamp >= cutoff:
+            recent.append(event)
+        else:
+            newest_older[event.session_id] = event
+
+    # Carry an old event forward only for a session that is still active, to
+    # preserve its topic/cwd. Everything else older than the cutoff goes.
+    live_recent = {e.session_id for e in recent}
+    carried = [e for sid, e in newest_older.items() if sid in live_recent]
+
+    kept = carried + recent
+    dropped = len(events) - len(kept)
+    if dropped <= 0:
+        return 0
+
+    # Write beside the target then replace: os.replace is atomic, so a reader
+    # sees either the old file or the new one, never a half-written log. A hook
+    # appending inside the swap window could lose one event — acceptable against
+    # unbounded growth, and it is why this never runs from the hook itself.
+    temp = target.with_suffix(".jsonl.compacting")
+    with open(temp, "w", encoding="utf-8") as fh:
+        for event in kept:
+            fh.write(json.dumps(event.to_json(), ensure_ascii=False) + "\n")
+    os.replace(temp, target)
+
+    return dropped
+
+
+def maybe_compact(
+    path: Path | str | None = None,
+    keep_hours: int = 72,
+    max_bytes: int = COMPACT_OVER_BYTES,
+) -> int:
+    """Compact only if the log has actually got big. Never raises."""
+    target = Path(path) if path is not None else state_path()
+    try:
+        if not target.is_file() or target.stat().st_size <= max_bytes:
+            return 0
+        return compact(target, keep_hours=keep_hours)
+    except OSError:
+        # Housekeeping must never be the reason a briefing fails.
+        return 0
+
+
+def _parse_at(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)

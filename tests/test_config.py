@@ -104,3 +104,43 @@ def test_config_sections_are_frozen():
     cfg = config_module.build(config_module.DEFAULTS)
     with pytest.raises(Exception):
         cfg.router.size_threshold_tokens = 1  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Empty sections — the shape a plausible hand-edit produces
+# ---------------------------------------------------------------------------
+
+def test_empty_section_does_not_crash(tmp_path):
+    """`brain:` with nothing indented under it parses to {"brain": None}. A
+    .get() default only applies when the key is ABSENT, so this produced an
+    AttributeError traceback — and _load_config catches only ConfigFileNotFound."""
+    path = tmp_path / "config.yml"
+    path.write_text("brain:\nvoice:\nrouter:\nsources:\n", encoding="utf-8")
+
+    cfg = config_module.load(str(path))
+
+    assert cfg.brain.provider == "openrouter"
+    assert cfg.voice.provider == "elevenlabs"
+    assert cfg.router.size_threshold_tokens > 0
+    assert cfg.sources.github.enabled is True
+
+
+def test_empty_nested_section_does_not_crash(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text("sources:\n  github:\n  sessions:\n", encoding="utf-8")
+
+    cfg = config_module.load(str(path))
+
+    assert cfg.sources.github.token_env == "MAJORDOMO_GH_TOKEN"
+    assert cfg.sources.sessions.stale_after_hours == 72
+
+
+def test_build_tolerates_none_sections_directly():
+    cfg = config_module.build({"brain": None, "voice": None, "sources": None, "router": None})
+    assert cfg.brain.provider == "openrouter"
+
+
+def test_repeat_after_minutes_is_configurable(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text("voice:\n  repeat_after_minutes: 15\n", encoding="utf-8")
+    assert config_module.load(str(path)).voice.repeat_after_minutes == 15

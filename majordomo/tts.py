@@ -119,10 +119,16 @@ def chunk_text(text: str, max_len: int = 400) -> list[str]:
     remaining = text
     while len(remaining) > max_len:
         window = remaining[:max_len]
+        # Track the boundary position and the cut point separately. Comparing a
+        # raw rfind index against a split_at that already had len(sep) added
+        # (as the original did) means a later separator can lose to an earlier
+        # one, and the chunk breaks at the wrong sentence.
+        best_at = -1
         split_at = -1
         for sep in (". ", "! ", "? ", "\n"):
             idx = window.rfind(sep)
-            if idx > split_at:
+            if idx > best_at:
+                best_at = idx
                 split_at = idx + len(sep)
         if split_at <= 0:
             idx = window.rfind(" ")

@@ -240,3 +240,18 @@ def test_read_stdin_returns_empty_on_tty(monkeypatch):
     monkeypatch.setattr("sys.stdin", fake)
 
     assert hook.read_stdin() == ""
+
+
+def test_errors_never_touch_the_real_home(monkeypatch, tmp_path):
+    """The hook logs swallowed failures to ~/.majordomo/error.log. Provoking one
+    in a test must land in the isolated home, not the developer's own log —
+    where a pytest traceback would later read as a real session failure."""
+    import os
+    from majordomo import paths
+
+    monkeypatch.setattr(hook, "read_stdin", lambda: "{broken json")
+    hook.run_hook("SessionStart", "startup", state_file=tmp_path / "state.jsonl")
+
+    written = paths.error_log_path()
+    assert written.is_file()
+    assert str(written).startswith(os.environ["MAJORDOMO_HOME"])

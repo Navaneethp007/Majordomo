@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from majordomo import coordinator
+from majordomo import coordinator, state
 from majordomo.config import Config
 from majordomo.models import Briefing, SourceReport
 from majordomo.workers import github, sessions
@@ -66,6 +66,10 @@ def gather(config: Config, state_file: Path | str | None = None) -> list[SourceR
 
 def run(config: Config, state_file: Path | str | None = None) -> BriefResult:
     """Fetch, route, fuse. Raises only MissingApiKey, which the CLI turns into an exit."""
+    # Housekeeping on the read path rather than in the hook: this runs a few
+    # times a day, the hook runs on every prompt. No-ops unless the log is big.
+    state.maybe_compact(state_file, keep_hours=config.sources.sessions.stale_after_hours)
+
     raw = gather(config, state_file)
     routed = [coordinator.route_report(report, config) for report in raw]
     briefing = coordinator.fuse(routed, config)

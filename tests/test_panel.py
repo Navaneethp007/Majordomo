@@ -152,3 +152,87 @@ def test_unknown_path_is_404(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         get(f"http://127.0.0.1:{port}/api/nonsense?t={token_of(server)}")
     assert exc.value.code == 404
+
+
+# ---------------------------------------------------------------------------
+# Concurrency and error surfacing
+# ---------------------------------------------------------------------------
+
+def test_server_is_threaded(server):
+    """/api/brief runs the whole fetch->route->fuse with a 120s LLM timeout. On
+    a single-threaded server that held the only request slot, so any second
+    request hung the tab."""
+    from http.server import ThreadingHTTPServer
+
+    assert isinstance(server.server, ThreadingHTTPServer)
+
+
+def test_a_slow_brief_does_not_block_other_requests(monkeypatch):
+    """The concrete symptom: click Re-brief, then the page can't load anything."""
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def slow(config, state_file=None):
+        release.wait(timeout=10)
+        return brief.BriefResult(briefing=Briefing("done"))
+
+    monkeypatch.setattr(brief, "run", slow)
+    handle = panel.serve(CFG)
+    try:
+        port = handle.server.server_address[1]
+        slow_call = threading.Thread(
+            target=lambda: get(f"http://127.0.0.1:{port}/api/brief?t={token_of(handle)}")
+        )
+        slow_call.start()
+        time.sleep(0.3)  # let the slow request take a slot
+
+        status, _ = get(handle.url)  # must still be served
+        assert status == 200
+    finally:
+        release.set()
+        slow_call.join(timeout=10)
+        handle.stop()
+
+
+def test_missing_api_key_returns_an_error_not_a_dead_handler(monkeypatch):
+    """brief.run raises MissingApiKey by contract. Uncaught, the handler thread
+    died, no response arrived, and the page sat on 'Loading…' with no reason."""
+    from majordomo.llm import MissingApiKey
+
+    def boom(config, state_file=None):
+        raise MissingApiKey("Set the OPENROUTER_API_KEY environment variable")
+
+    monkeypatch.setattr(brief, "run", boom)
+    handle = panel.serve(CFG)
+    try:
+        port = handle.server.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            get(f"http://127.0.0.1:{port}/api/brief?t={token_of(handle)}")
+        assert exc.value.code == 500
+        assert "OPENROUTER_API_KEY" in exc.value.read().decode()
+    finally:
+        handle.stop()
+
+
+def test_an_unexpected_error_also_returns_json(monkeypatch):
+    def boom(config, state_file=None):
+        raise RuntimeError("something odd")
+
+    monkeypatch.setattr(brief, "run", boom)
+    handle = panel.serve(CFG)
+    try:
+        port = handle.server.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            get(f"http://127.0.0.1:{port}/api/brief?t={token_of(handle)}")
+        assert exc.value.code == 500
+        assert "something odd" in exc.value.read().decode()
+    finally:
+        handle.stop()
+
+
+def test_the_page_renders_errors_rather_than_hanging(server):
+    """The client half: without this the page shows 'Loading…' forever."""
+    _, body = get(server.url)
+    assert "res.ok" in body and "Briefing failed" in body

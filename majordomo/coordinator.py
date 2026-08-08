@@ -165,10 +165,18 @@ def fuse(reports: list[SourceReport], config: Config) -> Briefing:
         return Briefing(briefing_text="Nothing to report.", needs_you=[])
 
     try:
-        text = complete(
-            prompts.build_fuse_prompt(reports),
-            config.brain,
-            config.brain.fuser_model,
+        # `or ""` matches reduce_source and summarize_source. llm.complete now
+        # normalises a null content itself, so this is belt-and-braces — but
+        # fuse being the one caller without the guard is exactly how a null
+        # answer turned into an AttributeError that no `except LLMError`
+        # anywhere up the stack could catch.
+        text = (
+            complete(
+                prompts.build_fuse_prompt(reports),
+                config.brain,
+                config.brain.fuser_model,
+            )
+            or ""
         ).strip()
     except (LLMError, MissingApiKey):
         # The Voicelog degradation pattern: you still get the information, just

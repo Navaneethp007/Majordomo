@@ -149,3 +149,132 @@ def test_unknown_status_is_skipped(tmp_path):
         )
 
     assert state.read_events(path) == []
+
+
+# ---------------------------------------------------------------------------
+# Compaction — the hook appends forever; every read parses the whole file
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+NOW = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+
+
+def at(delta_hours: int) -> str:
+    return (NOW - timedelta(hours=delta_hours)).isoformat()
+
+
+def test_compact_drops_events_past_the_window(tmp_path):
+    path = tmp_path / "state.jsonl"
+    for i in range(50):
+        state.append_event(make_event("old", "active", at=at(200)), path)
+    state.append_event(make_event("new", "active", at=at(1)), path)
+
+    dropped = state.compact(path, keep_hours=72, now=NOW)
+
+    assert dropped > 0
+    assert len(state.read_events(path)) < 51
+
+
+def test_compact_keeps_recent_events_intact(tmp_path):
+    path = tmp_path / "state.jsonl"
+    for i in range(5):
+        state.append_event(make_event(f"s{i}", "blocked", at=at(1)), path)
+
+    state.compact(path, keep_hours=72, now=NOW)
+
+    assert len(state.read_events(path)) == 5
+
+
+def test_compact_preserves_the_topic_of_a_long_running_session(tmp_path):
+    """A topic is set once by UserPromptSubmit and never repeated. A session
+    started four days ago and still active must keep it, or folding afterwards
+    loses what the session was about."""
+    path = tmp_path / "state.jsonl"
+    state.append_event(make_event("long", "active", at=at(100), topic="the big refactor"), path)
+    state.append_event(make_event("long", "blocked", at=at(1)), path)  # recent, no topic
+
+    state.compact(path, keep_hours=72, now=NOW)
+
+    from majordomo.workers.sessions import fold
+    folded = fold(state.read_events(path), now=NOW)
+    assert folded[0].topic == "the big refactor"
+
+
+def test_compact_discards_old_sessions_with_no_recent_activity(tmp_path):
+    """These are what make the log grow forever — one dead id per terminal ever
+    opened. fold drops them as stale anyway, so keeping them buys nothing."""
+    path = tmp_path / "state.jsonl"
+    for i in range(200):
+        state.append_event(make_event(f"dead{i}", "active", at=at(500)), path)
+    state.append_event(make_event("live", "active", at=at(1)), path)
+
+    dropped = state.compact(path, keep_hours=72, now=NOW)
+
+    assert dropped == 200
+    assert [e.session_id for e in state.read_events(path)] == ["live"]
+
+
+def test_compact_discards_old_ended_sessions(tmp_path):
+    path = tmp_path / "state.jsonl"
+    state.append_event(make_event("done", "ended", at=at(100)), path)
+    state.append_event(make_event("live", "active", at=at(1)), path)
+
+    state.compact(path, keep_hours=72, now=NOW)
+
+    assert [e.session_id for e in state.read_events(path)] == ["live"]
+
+
+def test_compaction_is_idempotent(tmp_path):
+    """Running it twice must not keep churning the file."""
+    path = tmp_path / "state.jsonl"
+    for i in range(30):
+        state.append_event(make_event(f"o{i}", "active", at=at(500)), path)
+    state.append_event(make_event("live", "active", at=at(1)), path)
+
+    state.compact(path, keep_hours=72, now=NOW)
+    assert state.compact(path, keep_hours=72, now=NOW) == 0
+
+
+def test_compact_is_a_noop_when_nothing_to_drop(tmp_path):
+    path = tmp_path / "state.jsonl"
+    state.append_event(make_event("s1", "active", at=at(1)), path)
+    assert state.compact(path, keep_hours=72, now=NOW) == 0
+
+
+def test_compact_on_missing_file_is_zero(tmp_path):
+    assert state.compact(tmp_path / "absent.jsonl") == 0
+
+
+def test_maybe_compact_leaves_a_small_log_alone(tmp_path):
+    path = tmp_path / "state.jsonl"
+    state.append_event(make_event("s1", "active", at=at(500)), path)
+
+    assert state.maybe_compact(path, max_bytes=1_000_000) == 0
+    assert len(state.read_events(path)) == 1, "a small log must not be touched"
+
+
+def test_maybe_compact_fires_once_the_log_is_big(tmp_path):
+    path = tmp_path / "state.jsonl"
+    for i in range(200):
+        state.append_event(make_event(f"old{i}", "active", at=at(500)), path)
+    state.append_event(make_event("live", "active", at=at(1)), path)
+
+    assert state.maybe_compact(path, keep_hours=72, max_bytes=100) > 0
+    assert len(state.read_events(path)) < 50, "the log must actually shrink"
+
+
+def test_maybe_compact_never_raises(tmp_path):
+    """Housekeeping must not be the reason a briefing fails."""
+    assert state.maybe_compact(tmp_path / "nope" / "deep.jsonl") == 0
+
+
+def test_compaction_leaves_no_temp_file_behind(tmp_path):
+    path = tmp_path / "state.jsonl"
+    for i in range(20):
+        state.append_event(make_event(f"o{i}", "active", at=at(500)), path)
+    state.append_event(make_event("new", "active", at=at(1)), path)
+
+    state.compact(path, keep_hours=72, now=NOW)
+
+    assert list(tmp_path.glob("*.compacting")) == []

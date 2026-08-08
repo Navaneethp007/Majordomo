@@ -45,6 +45,49 @@ def _load_config(args):
 # mj brief
 # ---------------------------------------------------------------------------
 
+def should_speak(args, config, briefing, reports=None, now=None) -> bool:
+    """Decide whether this briefing gets read aloud.
+
+    Three modes, because the right answer differs by who asked:
+
+    - ``--no-speak``            never. Text only.
+    - ``--speak-if-needed``     only when something needs you, and only if we
+                                have not already said this exact thing recently.
+    - default                   always (you asked for a briefing; you get one).
+
+    The middle mode is what the wake/boot/login trigger uses, and it has to
+    handle two things beyond "is anything pending".
+
+    **Silence must not be ambiguous.** Under ``pythonw.exe`` there is no console
+    — ``sys.stdout`` is None and every print is discarded — so audio is the only
+    channel the scheduled task has. A failed source carries no ``needs_you``
+    items, so gating purely on that made an expired GitHub token sound exactly
+    like a quiet morning. A source being down is itself worth saying.
+
+    **Repetition must not be endless.** See ``speechgate``: the same situation
+    stays quiet until it changes or ``repeat_after_minutes`` elapses.
+    """
+    from majordomo import speechgate
+
+    if not config.voice.enabled or args.no_speak:
+        return False
+    if not args.speak_if_needed:
+        return True
+
+    reports = reports or []
+    something_needs_you = bool(briefing.needs_you)
+    something_is_down = any(not r.ok for r in reports)
+    if not (something_needs_you or something_is_down):
+        return False
+
+    fingerprint = speechgate.fingerprint(briefing, reports)
+    if speechgate.is_repeat(fingerprint, config.voice.repeat_after_minutes, now=now):
+        return False
+
+    speechgate.record(fingerprint, now=now)
+    return True
+
+
 def cmd_brief(args) -> None:
     from majordomo import brief, tts
     from majordomo.llm import MissingApiKey
@@ -70,7 +113,7 @@ def cmd_brief(args) -> None:
         print()
         print(result.explain())
 
-    if config.voice.enabled and not args.no_speak:
+    if should_speak(args, config, result.briefing, result.reports):
         try:
             print("Speaking… (Ctrl+C to skip)", file=sys.stderr)
             tts.speak(result.briefing.briefing_text, config.voice)
@@ -245,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_brief = sub.add_parser("brief", help="fetch, fuse, print and speak the briefing")
     p_brief.add_argument("--no-speak", action="store_true", help="text only")
+    p_brief.add_argument(
+        "--speak-if-needed",
+        action="store_true",
+        help="speak only when something actually needs you (what the wake trigger uses)",
+    )
     p_brief.add_argument(
         "--explain",
         action="store_true",
