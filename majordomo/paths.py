@@ -32,6 +32,36 @@ def error_log_path() -> Path:
     return majordomo_home() / "error.log"
 
 
+def activity_path() -> Path:
+    """The append-only log of your own GitHub activity."""
+    return majordomo_home() / "activity.jsonl"
+
+
+def activity_fetched_path() -> Path:
+    """When we last *asked* GitHub, which is not when you last did something.
+
+    Kept apart from the log because they answer different questions: the log's
+    newest entry is when you last pushed, and a quiet week would otherwise look
+    exactly like a cold cache.
+    """
+    return majordomo_home() / "activity.fetched"
+
+
+def memory_dir() -> Path:
+    """One file per remembered fact. See ``majordomo.memory``."""
+    return majordomo_home() / "memory"
+
+
+def memory_index_path() -> Path:
+    """The one-line-per-memory index. Small enough to load on every turn."""
+    return memory_dir() / "INDEX.md"
+
+
+def chats_dir() -> Path:
+    """Saved ``mj chat`` transcripts, one JSONL file per session."""
+    return majordomo_home() / "chats"
+
+
 def backup_path(stamp: str) -> Path:
     return majordomo_home() / "backups" / f"settings.{stamp}.json"
 

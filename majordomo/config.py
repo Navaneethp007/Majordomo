@@ -11,6 +11,7 @@ Every knob has a default, so Majordomo runs with no config file at all.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -43,6 +44,14 @@ DEFAULTS: dict[str, Any] = {
         "fuser_model": "google/gemma-4-26b-a4b-it:free",
         "reducer_model": "nvidia/nemotron-3-super-120b-a12b:free",
         "worker_model": "google/gemma-4-26b-a4b-it:free",
+        # `mj ask` and `mj chat`. A different job from the briefing roles: those
+        # compress a payload once, this has to hold a thread across twenty turns
+        # and disagree with you. Picked for multi-turn tuning rather than speed.
+        "chat_model": "minimax/minimax-m3:free",
+        # When a chat's total context passes this, fold the oldest turns into a
+        # summary and keep the recent ones verbatim. The working set is expected
+        # around 20k; this is the alarm, not the target.
+        "chat_compact_threshold_tokens": 32_000,
         "timeout": 120.0,
         "temperature": 0.3,
     },
@@ -81,6 +90,13 @@ DEFAULTS: dict[str, Any] = {
             "token_env": "MAJORDOMO_GH_TOKEN",
             "api_base": "https://api.github.com",
             "timeout": 30.0,
+            # How far back `mj activity` reaches, and how much of the cache is
+            # considered current on read. Older entries stay on disk — pruning
+            # happens at read time, not by rewriting the log.
+            "activity_days": 90,
+            # Per-search cap. The window already bounds this; the cap is what
+            # stops a pathological month from becoming an unbounded fetch.
+            "activity_per_page": 100,
         },
         "gmail": {
             # A digest source: it never contributes needs-you items.
@@ -121,6 +137,20 @@ DEFAULTS: dict[str, Any] = {
             "active_timeout_minutes": 90,
         },
     },
+    # What Majordomo has learned about you. One file per fact under
+    # ~/.majordomo/memory/, plus an index small enough to send every turn.
+    "memory": {
+        "enabled": True,
+        # How many memory *bodies* get loaded alongside the index. The index is
+        # always sent in full; bodies are the expensive part, so only the ones
+        # whose description matches the question come along.
+        "max_bodies_loaded": 8,
+    },
+    # `mj start` and the /build command inside a chat.
+    "scaffold": {
+        # Where new projects are created. `~` is expanded at load time.
+        "root": "~/projects",
+    },
     # The escalation gate. Deliberately deterministic: we don't spend a model
     # call deciding whether to use a model (spec §5).
     #
@@ -151,6 +181,9 @@ class BrainConfig:
     worker_model: str
     timeout: float
     temperature: float
+    # Defaulted so every existing construction of BrainConfig keeps working.
+    chat_model: str = "minimax/minimax-m3:free"
+    chat_compact_threshold_tokens: int = 32_000
 
 
 @dataclass(frozen=True)
@@ -174,6 +207,8 @@ class GitHubConfig:
     token_env: str
     api_base: str
     timeout: float
+    activity_days: int = 90
+    activity_per_page: int = 100
 
 
 @dataclass(frozen=True)
@@ -207,11 +242,26 @@ class RouterConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool = True
+    max_bodies_loaded: int = 8
+
+
+@dataclass(frozen=True)
+class ScaffoldConfig:
+    #: Already expanded — ``~`` is resolved in ``build()``, not by the caller.
+    root: str = ""
+
+
+@dataclass(frozen=True)
 class Config:
     brain: BrainConfig
     voice: VoiceConfig
     sources: SourcesConfig
     router: RouterConfig
+    # Defaulted so a Config built before these existed still constructs.
+    memory: MemoryConfig = MemoryConfig()
+    scaffold: ScaffoldConfig = ScaffoldConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +296,6 @@ def load(path: str | None) -> Config:
             return build(DEFAULTS)
         resolved = candidate
     else:
-        from pathlib import Path
-
         resolved = Path(path)
         if not resolved.is_file():
             raise ConfigFileNotFound(str(resolved))
@@ -279,6 +327,8 @@ def build(data: dict[str, Any]) -> Config:
     gmail = sources.get("gmail") or {}
     sessions = sources.get("sessions") or {}
     router = data.get("router") or {}
+    memory = data.get("memory") or {}
+    scaffold = data.get("scaffold") or {}
 
     d_brain = DEFAULTS["brain"]
     d_voice = DEFAULTS["voice"]
@@ -286,6 +336,8 @@ def build(data: dict[str, Any]) -> Config:
     d_gmail = DEFAULTS["sources"]["gmail"]
     d_sessions = DEFAULTS["sources"]["sessions"]
     d_router = DEFAULTS["router"]
+    d_memory = DEFAULTS["memory"]
+    d_scaffold = DEFAULTS["scaffold"]
 
     return Config(
         brain=BrainConfig(
@@ -295,6 +347,13 @@ def build(data: dict[str, Any]) -> Config:
             fuser_model=str(brain.get("fuser_model", d_brain["fuser_model"])),
             reducer_model=str(brain.get("reducer_model", d_brain["reducer_model"])),
             worker_model=str(brain.get("worker_model", d_brain["worker_model"])),
+            chat_model=str(brain.get("chat_model", d_brain["chat_model"])),
+            chat_compact_threshold_tokens=int(
+                brain.get(
+                    "chat_compact_threshold_tokens",
+                    d_brain["chat_compact_threshold_tokens"],
+                )
+            ),
             timeout=float(brain.get("timeout", d_brain["timeout"])),
             temperature=float(brain.get("temperature", d_brain["temperature"])),
         ),
@@ -318,6 +377,12 @@ def build(data: dict[str, Any]) -> Config:
                 token_env=str(github.get("token_env", d_github["token_env"])),
                 api_base=str(github.get("api_base", d_github["api_base"])).rstrip("/"),
                 timeout=float(github.get("timeout", d_github["timeout"])),
+                activity_days=int(
+                    github.get("activity_days", d_github["activity_days"])
+                ),
+                activity_per_page=int(
+                    github.get("activity_per_page", d_github["activity_per_page"])
+                ),
             ),
             gmail=GmailConfig(
                 enabled=bool(gmail.get("enabled", d_gmail["enabled"])),
@@ -345,6 +410,19 @@ def build(data: dict[str, Any]) -> Config:
         router=RouterConfig(
             size_threshold_tokens=int(
                 router.get("size_threshold_tokens", d_router["size_threshold_tokens"])
+            ),
+        ),
+        memory=MemoryConfig(
+            enabled=bool(memory.get("enabled", d_memory["enabled"])),
+            max_bodies_loaded=int(
+                memory.get("max_bodies_loaded", d_memory["max_bodies_loaded"])
+            ),
+        ),
+        scaffold=ScaffoldConfig(
+            # Expanded here so no caller ever has to remember to. A config
+            # holding a literal "~/projects" would create a folder called "~".
+            root=str(
+                Path(str(scaffold.get("root", d_scaffold["root"]))).expanduser()
             ),
         ),
     )

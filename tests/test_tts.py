@@ -1,6 +1,8 @@
 """Tests for the vendored TTS — no real audio, no real network."""
 from __future__ import annotations
 
+import sys
+
 from unittest import mock
 
 import pytest
@@ -305,3 +307,74 @@ def test_elevenlabs_still_works_alongside(monkeypatch):
     with mock.patch("majordomo.tts.httpx.post", return_value=response) as post:
         tts.speak("Hello.", CFG)
     post.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Playback must be interruptible
+# ---------------------------------------------------------------------------
+
+def _fake_wave(seconds: float):
+    handle = mock.MagicMock()
+    handle.__enter__.return_value.getframerate.return_value = 100
+    handle.__enter__.return_value.getnframes.return_value = int(seconds * 100)
+    return handle
+
+
+def test_ctrl_c_stops_playback_instead_of_waiting_it_out(monkeypatch):
+    """`winsound.PlaySound` without SND_ASYNC blocks inside C.
+
+    Python's signal handler cannot run there, so Ctrl+C is queued and only
+    raises once the clip has finished — while the CLI is printing
+    "Ctrl+C to skip". The async-plus-poll form is what makes that true.
+    """
+    import _thread
+    import threading
+    import time
+
+    winsound = mock.MagicMock()
+    winsound.SND_FILENAME, winsound.SND_ASYNC, winsound.SND_PURGE = 1, 2, 4
+
+    monkeypatch.setitem(sys.modules, "winsound", winsound)
+    monkeypatch.setattr(tts.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(tts.wave, "open", lambda *a, **k: _fake_wave(10.0))
+
+    threading.Timer(0.2, _thread.interrupt_main).start()
+    started = time.monotonic()
+
+    with pytest.raises(KeyboardInterrupt):
+        tts._play("clip.wav")
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, "a 10s clip should be cut short, not waited out"
+    # and the sound is actually stopped, not left playing over the next output
+    assert any(call.args == (None, 4) for call in winsound.PlaySound.call_args_list)
+
+
+def test_playback_is_started_asynchronously(monkeypatch):
+    winsound = mock.MagicMock()
+    winsound.SND_FILENAME, winsound.SND_ASYNC, winsound.SND_PURGE = 1, 2, 4
+
+    monkeypatch.setitem(sys.modules, "winsound", winsound)
+    monkeypatch.setattr(tts.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(tts.wave, "open", lambda *a, **k: _fake_wave(0.0))
+
+    tts._play("clip.wav")
+
+    flags = winsound.PlaySound.call_args_list[0].args[1]
+    assert flags & winsound.SND_ASYNC
+
+
+def test_an_unreadable_wav_does_not_hang_playback(monkeypatch):
+    """A bad header must mean 'play and move on', not an unbounded wait."""
+    winsound = mock.MagicMock()
+    winsound.SND_FILENAME, winsound.SND_ASYNC, winsound.SND_PURGE = 1, 2, 4
+
+    def boom(*_a, **_k):
+        raise tts.wave.Error("bad header")
+
+    monkeypatch.setitem(sys.modules, "winsound", winsound)
+    monkeypatch.setattr(tts.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(tts.wave, "open", boom)
+
+    tts._play("clip.wav")          # must return promptly
+    assert winsound.PlaySound.called

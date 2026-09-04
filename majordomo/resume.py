@@ -68,6 +68,22 @@ def build(session: Session) -> ResumeCommand:
     )
 
 
+def spawn_detached(argv: list[str], cwd: str | None = None) -> None:
+    """Start a command in its own console, without waiting for it.
+
+    Shared with ``majordomo.scaffold``, which opens Claude Code in a freshly
+    created project. The Windows form is the fiddly part and is worth having in
+    exactly one place: ``start`` treats its first quoted argument as the window
+    *title*, so the empty string is load-bearing — omit it and a quoted program
+    path silently becomes a title and nothing launches.
+    """
+    if sys.platform == "win32":
+        # A new console, so launching doesn't hijack the terminal running `mj`.
+        subprocess.Popen(["cmd", "/c", "start", "", *argv], cwd=cwd)
+    else:  # pragma: no cover
+        subprocess.Popen(argv, cwd=cwd)
+
+
 def launch(command: ResumeCommand) -> None:
     """Actually run it. Separate from ``build`` so tests never launch anything."""
     if command.uri:
@@ -83,11 +99,4 @@ def launch(command: ResumeCommand) -> None:
     if not command.argv:  # pragma: no cover - build never produces this
         raise ResumeError("nothing to launch")
 
-    if sys.platform == "win32":
-        # A new console, so resuming doesn't hijack the terminal running `mj`.
-        subprocess.Popen(
-            ["cmd", "/c", "start", "", *command.argv],
-            cwd=command.cwd,
-        )
-    else:  # pragma: no cover
-        subprocess.Popen(command.argv, cwd=command.cwd)
+    spawn_detached(command.argv, cwd=command.cwd)

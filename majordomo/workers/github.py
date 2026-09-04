@@ -78,7 +78,13 @@ def resolve_token(cfg: GitHubConfig, env: dict[str, str] | None = None) -> str:
     )
 
 
-def _get(client: httpx.Client, url: str, params: dict | None = None) -> object:
+def get_json(client: httpx.Client, url: str, params: dict | None = None) -> object:
+    """One authenticated GET, decoded. Public because ``activity.py`` shares it.
+
+    Deliberately not private: the activity store makes the same kind of request
+    against the same API with the same error handling, and a second copy of this
+    would be a second place for the error contract to drift.
+    """
     response = client.get(url, params=params)
     if not response.is_success:
         raise GitHubError(f"HTTP {response.status_code}: {response.text[:200]}")
@@ -97,17 +103,17 @@ def fetch(cfg: GitHubConfig, token: str) -> dict[str, list]:
     }
 
     with httpx.Client(base_url=cfg.api_base, headers=headers, timeout=cfg.timeout) as client:
-        review_requests = _get(
+        review_requests = get_json(
             client,
             "/search/issues",
             {"q": "is:open is:pr review-requested:@me archived:false", "per_page": PER_PAGE},
         )
-        mine = _get(
+        mine = get_json(
             client,
             "/search/issues",
             {"q": "is:open is:pr author:@me archived:false", "per_page": PER_PAGE},
         )
-        notifications = _get(
+        notifications = get_json(
             client,
             "/notifications",
             {"participating": "true", "per_page": PER_PAGE},

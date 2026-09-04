@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
 
 import httpx
@@ -62,12 +63,38 @@ def _check_playback() -> None:
 
 
 def _play(path: str) -> None:
-    """Play a WAV file synchronously on the current OS. Patchable in tests."""
+    """Play a WAV file, interruptibly. Patchable in tests.
+
+    On Windows this is deliberately asynchronous-plus-poll rather than a plain
+    blocking play. ``winsound.PlaySound`` without ``SND_ASYNC`` blocks inside C,
+    where Python's signal handler cannot run — so Ctrl+C is queued and only
+    raises *after* playback has finished. The CLI prints "Ctrl+C to skip", which
+    made that a promise the code could not keep.
+
+    Polling needs an end time, and winsound exposes no "still playing?" query,
+    so the duration comes from the WAV header we wrote a moment earlier.
+    """
     system = platform.system()
     if system == "Windows":
         import winsound
 
-        winsound.PlaySound(path, winsound.SND_FILENAME)
+        try:
+            with wave.open(path, "rb") as handle:
+                rate = handle.getframerate() or 1
+                seconds = handle.getnframes() / float(rate)
+        except (OSError, wave.Error):
+            seconds = 0.0
+
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        try:
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            # Stop the sound before the caller unwinds, or it keeps playing
+            # over whatever is printed next.
+            winsound.PlaySound(None, winsound.SND_PURGE)
+            raise
         return
     if system == "Darwin":  # pragma: no cover
         subprocess.run(["afplay", path], check=True)
