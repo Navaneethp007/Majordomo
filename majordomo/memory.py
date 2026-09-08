@@ -154,6 +154,30 @@ def _tokens(text: str) -> set[str]:
     return {w for w in words if w and w not in _STOPWORDS and len(w) > 1}
 
 
+#: Suffixes stripped before comparing two facts. Crude on purpose — a real
+#: stemmer is a dependency, and the only job here is that "roast" and "roasted"
+#: stop looking like different subjects.
+_SUFFIXES = ("edly", "ing", "ed", "es", "ly", "s")
+
+
+def _stem(word: str) -> str:
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _same_word(a: str, b: str) -> bool:
+    """Close enough to be the same word: equal, or one abbreviates the other.
+
+    The prefix rule is what connects "med" to "medium". It needs a floor of
+    three characters or short tokens start matching everything.
+    """
+    if a == b:
+        return True
+    return min(len(a), len(b)) >= 3 and (a.startswith(b) or b.startswith(a))
+
+
 def looks_like_secret(text: str) -> bool:
     """Does this contain something that is obviously a credential?"""
     return any(pattern.search(text) for pattern in _SECRET_PATTERNS)
@@ -332,24 +356,33 @@ def read_index(root: Path | str | None = None) -> str:
 def find_similar(
     description: str,
     root: Path | str | None = None,
-    threshold: float = 0.6,
+    threshold: float = 0.5,
 ) -> Memory | None:
     """An existing memory covering roughly the same ground, if there is one.
 
     This is what makes ``write_memory`` able to offer update-instead-of-duplicate.
     Without it the set fills with six near-identical statements of the same
     preference and stops being worth reading.
+
+    **This is a hint, not a verdict.** Measured against a set of real pairs, no
+    threshold cleanly separates a restatement from a different fact: "Works
+    mainly in Python" and "Works mainly in Rust" share every word that word
+    overlap can see, and differ only in the one carrying the meaning. So it is
+    tuned to catch rather than to be certain, and the caller asks the user —
+    a wrong guess costs a keystroke, and a hard refusal here would just teach
+    everyone to reach for ``--force``.
     """
-    incoming = _tokens(description)
+    incoming = {_stem(t) for t in _tokens(description)}
     if not incoming:
         return None
 
     best: tuple[float, Memory] | None = None
     for memory in read_all(root):
-        existing = _tokens(memory.description)
+        existing = {_stem(t) for t in _tokens(memory.description)}
         if not existing:
             continue
-        overlap = len(incoming & existing) / min(len(incoming), len(existing))
+        hits = sum(any(_same_word(a, b) for b in existing) for a in incoming)
+        overlap = hits / min(len(incoming), len(existing))
         if overlap >= threshold and (best is None or overlap > best[0]):
             best = (overlap, memory)
 
@@ -381,7 +414,8 @@ def write_memory(
                    update-instead-of-duplicate.
 
     Raises:
-        MemoryError_: the candidate is empty, too long, or contains something
+        MemoryError_: the directory or the file could not be written, or the
+            candidate is empty, too long, or contains something
             that looks like a credential. Writes are the one operation here that
             is allowed to refuse — a bad memory is replayed into every future
             conversation, so it is worth stopping at the door.
@@ -408,7 +442,10 @@ def write_memory(
         )
 
     target = _root(root)
-    target.mkdir(parents=True, exist_ok=True)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise MemoryError_(f"could not create {target}: {exc}") from exc
 
     if overwrite:
         name = slugify(overwrite)
@@ -424,18 +461,35 @@ def write_memory(
         created=date.today().isoformat(),
     )
 
-    (target / f"{name}.md").write_text(render(memory), encoding="utf-8")
+    # A raw OSError here escapes every caller: they catch MemoryError_, and
+    # this surfaces on the chat REPL's exit path and out of `mj remember` — the
+    # two places least able to afford a traceback. A read-only directory, a full
+    # disk or a permission change is a refusal to write, which is exactly what
+    # MemoryError_ means.
+    try:
+        (target / f"{name}.md").write_text(render(memory), encoding="utf-8")
+    except OSError as exc:
+        raise MemoryError_(f"could not write {name}.md: {exc}") from exc
+
     _refresh_index(target)
     return memory
 
 
 def delete_memory(name: str, root: Path | str | None = None) -> bool:
-    """Remove one memory. Returns whether it existed."""
+    """Remove one memory. Returns whether it existed.
+
+    Raises:
+        MemoryError_: the file exists but could not be removed.
+    """
     target = _root(root)
     path = target / f"{slugify(name)}.md"
     if not path.is_file():
         return False
-    path.unlink()
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise MemoryError_(f"could not delete {path.name}: {exc}") from exc
+
     _refresh_index(target)
     return True
 

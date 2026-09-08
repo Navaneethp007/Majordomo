@@ -1,6 +1,8 @@
 """Tests for the memory layer — pure filesystem, no model, no network."""
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
 from majordomo import memory
@@ -327,3 +329,46 @@ def test_find_similar_ignores_an_unrelated_memory(tmp_path):
 
 def test_find_similar_on_an_empty_store(tmp_path):
     assert memory.find_similar("anything at all", root=tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# An unwritable directory
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_write_raises_memory_error_not_oserror(tmp_path):
+    """Callers catch MemoryError_, so a raw OSError escaped all of them — and
+    it surfaces on the chat REPL's exit path and out of `mj remember`, the two
+    places least able to afford a traceback."""
+    with mock.patch.object(
+        memory.Path, "write_text", side_effect=OSError("read-only file system")
+    ):
+        with pytest.raises(memory.MemoryError_) as exc_info:
+            memory.write_memory(
+                memory.MemoryCandidate(description="something"), root=tmp_path
+            )
+
+    assert "read-only file system" in str(exc_info.value)
+
+
+def test_a_directory_that_cannot_be_created_raises_memory_error(tmp_path):
+    with mock.patch.object(memory.Path, "mkdir", side_effect=OSError("denied")):
+        with pytest.raises(memory.MemoryError_):
+            memory.write_memory(
+                memory.MemoryCandidate(description="something"),
+                root=tmp_path / "nested",
+            )
+
+
+def test_a_failed_delete_raises_memory_error(tmp_path):
+    memory.write_memory(memory.MemoryCandidate(description="a fact"), root=tmp_path)
+    name = memory.read_all(tmp_path)[0].name
+
+    with mock.patch.object(memory.Path, "unlink", side_effect=OSError("in use")):
+        with pytest.raises(memory.MemoryError_):
+            memory.delete_memory(name, root=tmp_path)
+
+
+def test_deleting_something_absent_is_still_just_false(tmp_path):
+    """Absent is not an error — only a failure to remove one that is there."""
+    assert memory.delete_memory("never-existed", root=tmp_path) is False

@@ -83,7 +83,15 @@ def _play(path: str) -> None:
                 rate = handle.getframerate() or 1
                 seconds = handle.getnframes() / float(rate)
         except (OSError, wave.Error):
-            seconds = 0.0
+            # No duration means no deadline to poll against, and a deadline of
+            # "now" would return instantly — the caller's `finally` would then
+            # delete the file mid-playback and the briefing would stop after a
+            # fraction of a second, silently. Fall back to a blocking play: the
+            # briefing is heard in full, and the cost is that Ctrl+C cannot
+            # interrupt this one. Losing the skip is a far smaller failure than
+            # losing the message.
+            winsound.PlaySound(path, winsound.SND_FILENAME)
+            return
 
         winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
         try:

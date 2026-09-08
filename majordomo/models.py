@@ -180,3 +180,7 @@ class Briefing:
     needs_you: list[NeedsYouItem] = field(default_factory=list)
     #: Shown under "Also waiting" — visible, never phrased as an obligation.
     context: list[ContextItem] = field(default_factory=list)
+    #: Why the fusing step degraded, when it did. The per-source reasons live on
+    #: SourceReport; this is the one step that belongs to no source, and without
+    #: it a fallback briefing looks identical to a successful terse one.
+    note: str = ""

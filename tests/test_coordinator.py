@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import pytest
+from unittest import mock
 
 from majordomo import config as config_module, coordinator
 from majordomo.llm import LLMError, MissingApiKey
 from majordomo.models import NeedsYouItem, SourceReport
+
+CFG = config_module.build(config_module.DEFAULTS)
 
 
 def make_config(threshold=8000):
@@ -498,3 +501,81 @@ def test_context_items_survive_every_routing_path(monkeypatch):
     assert coordinator.route_report(
         source(pre_summarised=True), make_config()
     ).context_items == [mail]
+
+
+# ---------------------------------------------------------------------------
+# The fuser output guard
+# ---------------------------------------------------------------------------
+
+def test_a_reasoning_dump_falls_back_instead_of_being_spoken():
+    """A *successful* call returning nonsense must degrade like a failed one.
+
+    On 2026-09-01 a reasoning model answered the fuse prompt with nine
+    paragraphs of deliberation. No `except LLMError` caught it — the call
+    succeeded — so the pipeline printed it and handed it to TTS.
+    """
+    reports = [SourceReport("github", True, "Two PRs await review.")]
+    dump = "Here's a thinking process:\n\n" + ("1. Analyse the request. " * 300)
+
+    with mock.patch.object(coordinator, "complete", return_value=dump):
+        briefing = coordinator.fuse(reports, CFG)
+
+    assert briefing.briefing_text == coordinator._raw_briefing(reports)
+    assert "looks like reasoning" in briefing.note
+    assert str(coordinator.MAX_BRIEFING_CHARS) in briefing.note
+
+
+def test_an_ordinary_briefing_passes_through_untouched():
+    reports = [SourceReport("github", True, "Two PRs await review.")]
+
+    with mock.patch.object(
+        coordinator, "complete", return_value="Two pull requests are waiting on you."
+    ):
+        briefing = coordinator.fuse(reports, CFG)
+
+    assert briefing.briefing_text == "Two pull requests are waiting on you."
+    assert briefing.note == ""
+
+
+def test_a_long_but_legitimate_briefing_is_not_rejected():
+    """The guard is a nonsense detector, not a style rule."""
+    reports = [SourceReport("github", True, "x")]
+    wordy = "A" * (coordinator.MAX_BRIEFING_CHARS - 1)
+
+    with mock.patch.object(coordinator, "complete", return_value=wordy):
+        assert coordinator.fuse(reports, CFG).briefing_text == wordy
+
+
+def test_an_empty_reply_is_reported_not_silently_blank():
+    reports = [SourceReport("github", True, "Two PRs await review.")]
+
+    with mock.patch.object(coordinator, "complete", return_value=""):
+        briefing = coordinator.fuse(reports, CFG)
+
+    assert briefing.briefing_text == coordinator._raw_briefing(reports)
+    assert "returned nothing" in briefing.note
+
+
+def test_a_failed_call_records_why_it_degraded():
+    reports = [SourceReport("github", True, "Two PRs await review.")]
+
+    with mock.patch.object(coordinator, "complete", side_effect=LLMError("503")):
+        briefing = coordinator.fuse(reports, CFG)
+
+    assert "503" in briefing.note
+
+
+def test_explain_surfaces_a_degraded_fuse():
+    """The fusing step belongs to no source, so it has nowhere else to report."""
+    from majordomo import brief
+
+    reports = [SourceReport("github", True, "x")]
+    dump = "y" * 5000
+
+    with mock.patch.object(coordinator, "complete", return_value=dump):
+        result = brief.BriefResult(
+            briefing=coordinator.fuse(reports, CFG), reports=reports
+        )
+
+    assert "fuse" in result.explain()
+    assert "degraded" in result.explain()

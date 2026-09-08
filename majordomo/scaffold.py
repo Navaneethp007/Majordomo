@@ -59,6 +59,7 @@ class Plan:
                 f"  git init   {self.path}",
                 f"  write      {self.path / 'README.md'}",
                 f"  write      {self.path / 'BRIEF.md'}  ({len(self.brief)} chars)",
+                f"  write      {self.path / '.gitignore'}  (BRIEF.md is not tracked)",
                 f"  launch     claude {OPENING_PROMPT[:40]}…  (in {self.path})",
             ]
         )
@@ -95,6 +96,35 @@ def build_brief(idea: str, transcript: str, context_text: str) -> str:
     return "\n".join(parts)
 
 
+#: How much recent activity goes into a brief. The full context window uses 60,
+#: which is right for a briefing you read and throw away. A brief is written
+#: into a git repository and handed to another agent, so the two considerations
+#: that do not apply there apply here: sixty commits about an unrelated project
+#: crowd out the idea itself, and they describe work that is nobody's business
+#: but yours.
+BRIEF_ACTIVITY_LIMIT = 12
+
+#: Written alongside BRIEF.md, because `create` runs `git init` straight after.
+#:
+#: The brief is context about *you* — what you have been building, what you have
+#: asked to be remembered — assembled to orient an agent on its first turn. It
+#: is not project source. Without this, the first `git add .` in a new project
+#: commits your recent work across every repository you touch, and pushing that
+#: to a public remote publishes it. Delete the line if you want it tracked; that
+#: should be a decision rather than an accident.
+GITIGNORE = """\
+# Majordomo's handoff note: context about you, not part of the project.
+BRIEF.md
+
+__pycache__/
+.venv/
+venv/
+.env
+.env.*
+node_modules/
+"""
+
+
 def plan(name: str, brief: str, config: Config) -> Plan:
     """Resolve where this would go. Raises rather than overwrite anything."""
     root = Path(config.scaffold.root or Path.home() / "projects")
@@ -127,6 +157,7 @@ def create(target: Plan) -> tuple[Path, list[str]]:
             f"# {target.name}\n\nSee BRIEF.md.\n", encoding="utf-8"
         )
         (target.path / "BRIEF.md").write_text(target.brief, encoding="utf-8")
+        (target.path / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     except OSError as exc:
         raise ScaffoldError(f"could not write to {target.path}: {exc}") from exc
 
@@ -179,7 +210,7 @@ def start(
     """
     from majordomo import context as context_mod
 
-    ctx = context_mod.build(config, query=idea)
+    ctx = context_mod.build(config, query=idea, activity_limit=BRIEF_ACTIVITY_LIMIT)
     brief = build_brief(idea, transcript, ctx.render())
     target = plan(idea, brief, config)
 

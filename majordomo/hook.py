@@ -96,9 +96,15 @@ def status_for(event: str, matcher: str | None) -> SessionStatus | None:
         # clears a previous idle/blocked state and carries the new topic.
         return "active"
     if event == "Stop":
-        # Heartbeat only. The assistant finished a turn, which proves the
-        # session is alive — but it must not overwrite a blocked or idle
-        # status, so `fold` handles it specially via the `kind` field.
+        # A turn ended, which proves two things at once: the session is alive,
+        # and it is not blocked. A permission prompt happens *mid*-turn, so the
+        # turn cannot end while one is outstanding — a Stop after a block is how
+        # we learn you answered it, since approving emits no event of its own.
+        #
+        # This is deliberately a plain status like any other. An earlier version
+        # treated Stop as status-preserving, which left an approved session
+        # `blocked` forever while refreshing `at` on every turn kept the
+        # staleness sweep from ever retiring it. See `workers.sessions.fold`.
         return "active"
     if event == "SessionEnd":
         return "ended"

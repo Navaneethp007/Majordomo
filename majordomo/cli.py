@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from majordomo import __version__
 
@@ -231,10 +232,340 @@ def cmd_chat(args) -> None:
     from majordomo import chat as chat_mod
 
     config = _load_config(args)
+
+    if args.list:
+        saved = chat_mod.saved_sessions()
+        if not saved:
+            safe_print("No saved conversations yet.")
+            return
+        for path in reversed(saved):  # newest first, the way you think of them
+            safe_print("  " + chat_mod.describe_session(path))
+        return
+
+    transcript = None
+    if args.resume and args.resume is not True:
+        # A specific one, by id or unique prefix — the same matching `mj resume`
+        # uses for sessions, so the two commands behave alike.
+        transcript = chat_mod.find_session(args.resume)
+        if transcript is None:
+            count = chat_mod.match_count(args.resume)
+            problem = (
+                f"{args.resume!r} matches {count} conversations"
+                if count > 1
+                else f"no saved conversation starting with {args.resume!r}"
+            )
+            print(f"error: {problem}", file=sys.stderr)
+            print("(`mj chat --list` shows them)", file=sys.stderr)
+            sys.exit(1)
+
     try:
-        chat_mod.run(config, resume=args.resume)
+        chat_mod.run(config, resume=bool(args.resume), transcript=transcript)
     except KeyboardInterrupt:  # pragma: no cover - the loop catches its own
         safe_print("")
+
+
+def confirm_action(name: str, arguments: dict) -> bool:
+    """Show what is about to happen and ask. The safety gate, at the terminal.
+
+    Shows the *content* of a write and the whole command for a run — approving
+    something you cannot see is not approval. Defaults to no: a stray Enter
+    should decline, not authorise a change to your files.
+    """
+    from majordomo import tools
+
+    safe_print(f"\n  {tools.describe_call(name, arguments)}")
+    # (see _edit_preview for why an edit is not just two truncated blocks)
+
+    if name == "write_file":
+        content = tools.as_text(arguments.get("content"))
+        lines = content.splitlines()
+        for line in lines[:12]:
+            safe_print(f"    | {line}")
+        if len(lines) > 12:
+            safe_print(f"    | … {len(lines) - 12} more lines")
+    elif name == "edit_file":
+        for line in _edit_preview(
+            tools.as_text(arguments.get("old")), tools.as_text(arguments.get("new"))
+        ):
+            safe_print(f"    {line}")
+
+    if not sys.stdin.isatty():
+        # Piped or scripted: nobody can answer, so every gated call would be
+        # declined and the agent would spend its whole turn budget being told
+        # no. Say why once, and let the caller decide to pass --yes.
+        print(
+            "error: this needs approval and stdin is not a terminal — "
+            "re-run interactively, or pass --yes to approve everything",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    try:
+        answer = input("  allow this? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        safe_print("")
+        return False
+    return answer in ("y", "yes")
+
+
+#: Lines shown per side of an edit before eliding. Small enough to read at a
+#: glance, which is the only way a confirmation prompt actually gets read.
+EDIT_PREVIEW_LINES = 8
+
+
+def _edit_preview(old: str, new: str) -> list[str]:
+    """Render an edit as the part that actually changes.
+
+    Showing the first N lines of each side is wrong when they share a prefix —
+    an append produces two blocks that look identical, the change falls off the
+    bottom, and you approve a no-op that isn't one. That happened: an edit
+    adding a whole function previewed as three unchanged lines.
+
+    So trim the common prefix and suffix first, spend the budget on the
+    difference, and always say when something was elided. A gate that hides
+    what it is gating is worse than no gate — it manufactures confidence.
+    """
+    before, after = old.splitlines(), new.splitlines()
+
+    head = 0
+    while head < len(before) and head < len(after) and before[head] == after[head]:
+        head += 1
+
+    tail = 0
+    while (
+        tail < len(before) - head
+        and tail < len(after) - head
+        and before[-1 - tail] == after[-1 - tail]
+    ):
+        tail += 1
+
+    removed = before[head : len(before) - tail]
+    added = after[head : len(after) - tail]
+
+    lines: list[str] = []
+    if head:
+        lines.append(f"  {head} unchanged line(s)")
+    for marker, block in (("-", removed), ("+", added)):
+        for line in block[:EDIT_PREVIEW_LINES]:
+            lines.append(f"{marker} {line}")
+        if len(block) > EDIT_PREVIEW_LINES:
+            lines.append(f"{marker} … {len(block) - EDIT_PREVIEW_LINES} more line(s)")
+    if tail:
+        lines.append(f"  {tail} unchanged line(s)")
+
+    if not removed and not added:
+        # Whitespace-only, or a genuine no-op. Either way, say so rather than
+        # printing nothing and leaving the prompt looking like a bug.
+        lines.append("  (no visible change — whitespace only)")
+    return lines
+
+
+def cmd_do(args) -> None:
+    """Give the agent a task in the current directory."""
+    from majordomo import agent
+
+    config = _load_config(args)
+    task = " ".join(args.task).strip()
+    if not task:
+        print("error: do what?", file=sys.stderr)
+        sys.exit(1)
+
+    root = Path(args.directory or ".")
+    if not root.is_dir():
+        # write_file creates parent directories, which is what lets the agent
+        # build src/calc/ from nothing — but it also means a typo here would
+        # quietly populate a whole bogus tree instead of failing. The project
+        # root is the one path we will not create on your behalf.
+        print(f"error: no directory at {root}", file=sys.stderr)
+        sys.exit(1)
+
+    confirm = agent.always_allow if args.yes else confirm_action
+
+    if args.yes:
+        print(
+            "warning: --yes approves every write and command without asking",
+            file=sys.stderr,
+        )
+
+    from majordomo.llm import MissingApiKey
+
+    try:
+        outcome = agent.run(task, config, root=root, confirm=confirm, write=safe_print)
+    except MissingApiKey as exc:
+        # agent.run swallows LLMError so a half-finished task keeps its trail,
+        # but a missing key is unrecoverable and identical on every retry —
+        # same policy as every other command here.
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if outcome.answer:
+        from majordomo import render as render_mod
+
+        safe_print("")
+        safe_print(render_mod.render(outcome.answer))
+    elif not outcome.stopped_because:
+        # A model can end its turn with no text and no tool call. Without this
+        # the command printed nothing whatsoever and exited 0 — no answer, no
+        # error, no way to tell it from a task that needed no output.
+        # `chat.send` has guarded this with "(empty response)" all along.
+        print(
+            "warning: the agent finished without saying anything"
+            + (
+                f" (it did run {len(outcome.steps)} step(s) — check the files)"
+                if outcome.steps
+                else ""
+            ),
+            file=sys.stderr,
+        )
+
+    if outcome.stopped_because:
+        print(f"\nstopped: {outcome.stopped_because}", file=sys.stderr)
+
+    declined = [s for s in outcome.steps if not s.approved]
+    if declined:
+        print(f"({len(declined)} action(s) declined)", file=sys.stderr)
+
+
+def cmd_config(args) -> None:
+    """Show what configuration is in force, or install the annotated example.
+
+    Every model here is a config value rather than code, but nothing said so —
+    the defaults were only visible by reading ``config.py``. This makes the
+    roles and their current values something you can look at.
+    """
+    from majordomo.paths import default_config_path
+
+    target = Path(args.config) if args.config else default_config_path()
+
+    if args.init:
+        # Beside this module, not at the repo root — a wheel install has no repo
+        # root, and this has to work for someone who ran `pip install`.
+        example = Path(__file__).resolve().parent / "config.example.yml"
+        if not example.is_file():
+            print(f"error: no example at {example}", file=sys.stderr)
+            sys.exit(1)
+        if target.exists() and not args.force:
+            print(
+                f"error: {target} already exists — pass --force to overwrite, "
+                f"or edit it directly",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError as exc:
+            print(f"error: could not write {target}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        safe_print(f"Wrote {target}.")
+        safe_print("Every value is commented. Nothing in it is required.")
+        return
+
+    config = _load_config(args)
+    brain = config.brain
+
+    safe_print(f"  file       {target}{'' if target.is_file() else '  (absent — using defaults)'}")
+    safe_print(f"  provider   {brain.provider}  ->  {brain.base_url}")
+    import os
+
+    key_state = "set" if os.environ.get(brain.api_key_env) else "NOT SET"
+    safe_print(f"  key from   {brain.api_key_env}  ({key_state})")
+    safe_print("")
+    safe_print("  Models, by role:")
+    for role, model, purpose in (
+        ("worker", brain.worker_model, "compress each source"),
+        ("fuser", brain.fuser_model, "write the spoken briefing"),
+        ("reducer", brain.reducer_model, "handle an oversized payload"),
+        ("chat", brain.chat_model, "mj ask, mj chat"),
+        ("agent", brain.agent_model or f"{brain.chat_model}  (via chat)", "mj do, /agent"),
+        ("fallback", brain.fallback_model or "(none)", "when a role's model fails"),
+    ):
+        safe_print(f"    {role:<9} {model}")
+        safe_print(f"    {'':<9}   {purpose}")
+    safe_print("")
+    if not target.is_file():
+        safe_print("  `mj config --init` writes an annotated file you can edit.")
+
+
+def cmd_mic(args) -> None:
+    """Report what your microphone sounds like, in the numbers voice input uses.
+
+    Voice failing is almost always one threshold being wrong for one microphone,
+    and nothing about the symptom says so — the recording just stops early. This
+    turns that into a number you can put in the config.
+    """
+    from majordomo import asr
+
+    config = _load_config(args)
+
+    try:
+        result = asr.measure(config.voice, seconds=args.seconds, write=safe_print)
+    except asr.ASRError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    safe_print("")
+    safe_print(f"  quietest chunk    {result['min']:.0f}")
+    safe_print(f"  median            {result['p50']:.0f}")
+    safe_print(f"  90th percentile   {result['p90']:.0f}")
+    safe_print(f"  loudest chunk     {result['max']:.0f}")
+    safe_print(f"  threshold in use  {result['threshold']:.0f}")
+    safe_print(f"  counted as quiet  {result['quiet_fraction']:.0%} of the time")
+    safe_print(
+        f"  longest quiet run {result['longest_quiet_ms']}ms "
+        f"(recording stops at {result['stops_at_ms']}ms)"
+    )
+    safe_print("")
+
+    # p10 stands in for your pauses, p90 for your speech. The threshold has to
+    # sit between them — and if there is no gap, the recording contained no
+    # speech at all, which is a different problem with a different fix. Advising
+    # a number in that case is how you end up told to set a threshold below your
+    # own room tone.
+    quiet_level = result["p10"]
+    loud_level = result["p90"]
+
+    if loud_level < max(quiet_level * 3, 1):
+        safe_print(
+            "Nothing here looks like speech — the loud and quiet parts sit at "
+            "the same level, so this was room tone throughout. Run it again and "
+            "talk for the whole measurement."
+        )
+        return
+
+    if quiet_level < result["threshold"] < loud_level:
+        safe_print("These look healthy — speech clears the threshold, pauses do not.")
+        return
+
+    if result["threshold"] >= loud_level:
+        safe_print(
+            "This would have cut you off: the threshold sits above your "
+            "speaking level, so every chunk read as silence."
+        )
+    else:
+        safe_print(
+            "This would never stop on its own: the threshold sits below your "
+            "room tone, so nothing ever reads as silence."
+        )
+    safe_print("Put this in ~/.majordomo/config.yml:")
+    safe_print(f"\n  voice:\n    silence_rms: {int((quiet_level * loud_level) ** 0.5)}\n")
+
+
+def cmd_review(args) -> None:
+    """Hand a repository to Claude Code for a review.
+
+    Majordomo cannot read code — its context is memory and GitHub *activity*.
+    Rather than build a second code reviewer, it opens the one you already have.
+    """
+    from majordomo.resume import spawn_detached
+
+    target = Path(args.directory or ".").resolve()
+    if not target.is_dir():
+        print(f"error: no directory at {target}", file=sys.stderr)
+        sys.exit(1)
+
+    safe_print(f"Opening Claude Code in {target}…")
+    spawn_detached(["claude", "/code-review"], cwd=str(target))
 
 
 def cmd_start(args) -> None:
@@ -292,7 +623,10 @@ def cmd_ask(args) -> None:
         print(f"error: the model call failed ({exc})", file=sys.stderr)
         sys.exit(1)
 
-    safe_print((reply or "").strip() or "(empty response)")
+    from majordomo import render as render_mod
+
+    answer = (reply or "").strip() or "(empty response)"
+    safe_print(render_mod.render(answer))
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +675,44 @@ def cmd_activity(args) -> None:
 # mj remember
 # ---------------------------------------------------------------------------
 
+def _resolve_similar(similar) -> str:
+    """Ask what to do about a memory that looks like an existing one.
+
+    Returns "update", "keep" or "cancel".
+
+    This used to refuse outright and tell you to re-run with a flag. But the
+    similarity check is a noisy heuristic — see ``memory.find_similar`` — so a
+    refusal is wrong often enough that the habit it teaches is reflexive
+    ``--force``, which is the same as not having the check at all. A question
+    costs one keystroke when it guesses wrong.
+
+    Non-interactive callers still get the old refusal: a script must not block
+    on a prompt nobody is there to answer.
+    """
+    safe_print(f"\n  This looks close to {similar.name!r}:")
+    safe_print(f"    {similar.description}")
+
+    if not sys.stdin.isatty():
+        print(
+            f"error: re-run with --update {similar.name} to replace it, "
+            f"or --force to keep both",
+            file=sys.stderr,
+        )
+        return "cancel"
+
+    try:
+        answer = input("  [u]pdate it, [k]eep both, [c]ancel? ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        safe_print("")
+        return "cancel"
+
+    if answer.startswith("u"):
+        return "update"
+    if answer.startswith("k"):
+        return "keep"
+    return "cancel"
+
+
 def cmd_remember(args) -> None:
     """Write, list, or forget one memory.
 
@@ -358,7 +730,12 @@ def cmd_remember(args) -> None:
         sys.exit(1)
 
     if args.forget:
-        if memory_mod.delete_memory(args.forget):
+        try:
+            existed = memory_mod.delete_memory(args.forget)
+        except memory_mod.MemoryError_ as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if existed:
             safe_print(f"Forgot {args.forget}.")
         else:
             print(f"error: no memory named {args.forget!r}", file=sys.stderr)
@@ -399,14 +776,11 @@ def cmd_remember(args) -> None:
     if not args.update and not args.force:
         similar = memory_mod.find_similar(text)
         if similar is not None:
-            print(
-                f"error: this looks like it already covers {similar.name!r}:\n"
-                f"         {similar.description}\n"
-                f"       re-run with --update {similar.name} to replace it, "
-                f"or --force to keep both",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            choice = _resolve_similar(similar)
+            if choice == "cancel":
+                sys.exit(1)
+            if choice == "update":
+                args.update = similar.name
 
     try:
         written = memory_mod.write_memory(
@@ -550,9 +924,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_chat = sub.add_parser("chat", help="an interactive session with your context loaded")
     p_chat.add_argument(
-        "--resume", action="store_true", help="continue the most recent conversation"
+        "--resume",
+        nargs="?",
+        const=True,
+        metavar="ID",
+        help="continue a conversation: the most recent, or one by id/prefix",
+    )
+    p_chat.add_argument(
+        "--list", action="store_true", help="list saved conversations and exit"
     )
     p_chat.set_defaults(func=cmd_chat)
+
+    p_do = sub.add_parser("do", help="give the agent a task in this directory")
+    p_do.add_argument("task", nargs="+", help="what you want done")
+    p_do.add_argument(
+        "--directory", "-C", default=None, help="work here instead of the current directory"
+    )
+    p_do.add_argument(
+        "--yes",
+        action="store_true",
+        help="approve every write and command without asking (careful)",
+    )
+    p_do.set_defaults(func=cmd_do)
+
+    p_review = sub.add_parser("review", help="open Claude Code on a repo to review it")
+    p_review.add_argument(
+        "directory", nargs="?", default=None, help="the repo (default: here)"
+    )
+    p_review.set_defaults(func=cmd_review)
+
+    p_config = sub.add_parser(
+        "config", help="show the active configuration, or install the example"
+    )
+    p_config.add_argument(
+        "--init", action="store_true", help="write the annotated example config"
+    )
+    p_config.add_argument(
+        "--force", action="store_true", help="overwrite an existing config file"
+    )
+    p_config.set_defaults(func=cmd_config)
+
+    p_mic = sub.add_parser("mic", help="measure your microphone, to tune voice input")
+    p_mic.add_argument(
+        "--seconds", type=float, default=10.0, help="how long to record (default: 10)"
+    )
+    p_mic.set_defaults(func=cmd_mic)
 
     p_start = sub.add_parser("start", help="scaffold a repo and open Claude Code in it")
     p_start.add_argument("idea", nargs="+", help="what you want to build")

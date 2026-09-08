@@ -15,9 +15,18 @@ Two consequences worth stating, because they are the point:
 discipline ``state.py`` uses and for the same reason: a torn final line from a
 process killed mid-write must cost one event, not the whole history.
 
-Pruning happens **on read**, never by rewriting the file. Rewriting an
-append-only log is where append-only logs go to get corrupted, and the file is
-small enough that carrying a few thousand dead lines costs nothing.
+Two different prunings, and the distinction matters:
+
+- **The read window** (``recent``) filters in memory and never touches the file.
+  This is what ``activity_days`` controls, and it is cheap.
+- **Compaction** (``compact``) does rewrite, but only past a size threshold and
+  only from ``refresh`` — never from a read path. It keeps a window twice as
+  wide as the read window, because dropping an event the moment it leaves view
+  means a later widening of ``activity_days`` finds nothing behind it.
+
+Rewriting an append-only log is where such logs get corrupted, so the rewrite
+goes through ``jsonlog.rewrite`` — write beside the target, then replace, which
+is atomic. Shared with ``state.py`` so a fix to it reaches both.
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -31,6 +40,7 @@ from pathlib import Path
 import httpx
 
 from majordomo.config import Config, GitHubConfig
+from majordomo import jsonlog
 from majordomo.paths import activity_fetched_path, activity_path
 from majordomo.workers.github import GitHubError, get_json, resolve_token
 
@@ -162,12 +172,24 @@ def recent(
 ) -> list[ActivityEvent]:
     """Events inside the window, newest first. Never raises.
 
+    The window is **calendar days**, counted back from midnight today. A rolling
+    ``now - days`` made ``--days 0`` a cutoff of *this instant*, so it could only
+    ever match events in the future and always returned nothing — while the CLI
+    described it as "just today". Counting from midnight makes 0 mean today, 1
+    mean since yesterday morning, and 7 mean the last week, which is what the
+    flag reads as.
+
     ``now`` is injectable for the same reason it is in the sessions worker:
     reading the wall clock directly makes every fixture-dated test pass today
     and fail next quarter.
     """
     moment = now or datetime.now(timezone.utc)
-    cutoff = moment - timedelta(days=days)
+    # Midnight *where you are*, not midnight UTC. "Today" is a local idea: at
+    # UTC-5, snapping to UTC midnight puts the cutoff five hours into your
+    # morning and `--days 0` silently drops everything you did before lunch.
+    local = moment.astimezone()
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = midnight - timedelta(days=max(0, days))
 
     kept = []
     for event in read_events(path):
@@ -272,6 +294,85 @@ def append_events(
 
 
 # ---------------------------------------------------------------------------
+# Compaction — the same shape as state.compact, deliberately
+# ---------------------------------------------------------------------------
+
+#: Compact once the log passes this. Roughly 10k events, or years of activity.
+#: Re-exported from ``jsonlog`` so callers of this module keep working.
+COMPACT_OVER_BYTES = jsonlog.COMPACT_OVER_BYTES
+
+#: Keep this multiple of ``activity_days`` when compacting. Wider than the read
+#: window on purpose: dropping an event the moment it leaves the window means a
+#: later widening of ``activity_days`` finds nothing behind it, and re-fetching
+#: only reaches as far back as GitHub's search will go.
+KEEP_WINDOW_MULTIPLE = 2
+
+#: Never compact to a window narrower than this, whatever ``activity_days`` says.
+#: The read window is a display preference and can legitimately be 0 ("today");
+#: the *cache* is history, and history you throw away does not come back — the
+#: search API stops at 1000 results however far you ask it to reach.
+MIN_KEEP_DAYS = 30
+
+
+def compact(
+    path: Path | str | None = None,
+    keep_days: int = 180,
+    now: datetime | None = None,
+) -> int:
+    """Rewrite the log keeping only what is still in range. Returns lines dropped.
+
+    Shares the rewrite with :func:`majordomo.state.compact` via ``jsonlog`` —
+    the atomic part, which is what matters. What each keeps differs and stays
+    here: sessions carry an old event forward to preserve a topic, and activity
+    simply drops anything outside the window.
+
+    Simpler than the state version in one respect: there is no topic to carry
+    forward, so an event outside the window is simply gone.
+    """
+    target = Path(path) if path is not None else activity_path()
+    if not target.is_file():
+        return 0
+
+    moment = now or datetime.now(timezone.utc)
+    cutoff = moment - timedelta(days=keep_days)
+
+    events = read_events(target)
+    if not events:
+        return 0
+
+    # An unparseable timestamp is kept, matching `recent`: losing an event to a
+    # malformed date is worse than carrying it.
+    kept = [
+        e for e in events
+        if (stamp := _parse_at(e.at)) is None or stamp >= cutoff
+    ]
+
+    dropped = len(events) - len(kept)
+    if dropped <= 0:
+        return 0
+
+    jsonlog.rewrite(target, kept)
+
+    return dropped
+
+
+def maybe_compact(
+    path: Path | str | None = None,
+    keep_days: int = 180,
+    max_bytes: int = COMPACT_OVER_BYTES,
+) -> int:
+    """Compact only if the log has actually got big. Never raises."""
+    target = Path(path) if path is not None else activity_path()
+    try:
+        if not jsonlog.is_large(target, max_bytes):
+            return 0
+        return compact(target, keep_days=keep_days)
+    except OSError:
+        # Housekeeping must never be the reason a question goes unanswered.
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Fetching
 # ---------------------------------------------------------------------------
 
@@ -289,6 +390,20 @@ def _items(payload: object) -> list:
         found = payload.get("items")
         return found if isinstance(found, list) else []
     return payload if isinstance(payload, list) else []
+
+
+def _total_count(payload: object) -> int | None:
+    """How many results GitHub says exist, or None if it didn't say.
+
+    This is what makes truncation visible. Search responses carry it and we
+    used to read only ``items`` — so a search returning exactly ``per_page``
+    results was indistinguishable from one that happened to have that many.
+    """
+    if isinstance(payload, dict):
+        total = payload.get("total_count")
+        if isinstance(total, int):
+            return total
+    return None
 
 
 def _as_pr(item: dict) -> ActivityEvent | None:
@@ -338,6 +453,50 @@ def _as_comment(item: dict) -> ActivityEvent | None:
     )
 
 
+#: GitHub's search API will not return results beyond this offset. Ask for page
+#: 11 at 100 per page and you get a 422, not an empty page — so this is a wall,
+#: not a preference, and no configuration can move it.
+SEARCH_RESULT_CEILING = 1_000
+
+
+#: GitHub rejects a per_page above this and substitutes its own default.
+MAX_PER_PAGE = 100
+
+
+def _per_page(cfg: GitHubConfig) -> int:
+    """Results per request, clamped to what the API will actually honour.
+
+    Clamping only inside ``_last_page`` was not enough: the unclamped value also
+    went into the request *and* into the ``len(items) < per_page`` stop
+    condition, where a 0 can never be reached — so every page was fetched
+    whether or not there was anything left. Same shape as the ``max_messages: 0``
+    bug in the Gmail worker: a limit that is only enforced in one of the places
+    it is read.
+    """
+    return max(1, min(cfg.activity_per_page, MAX_PER_PAGE))
+
+
+def _last_page(cfg: GitHubConfig) -> int:
+    """The highest page worth requesting: your setting, or the API's wall."""
+    return max(1, min(cfg.activity_max_pages, SEARCH_RESULT_CEILING // _per_page(cfg)))
+
+
+def _how_to_get_more(cfg: GitHubConfig) -> str:
+    """What to actually do about a truncated search.
+
+    This used to say "raise sources.github.activity_max_pages" unconditionally.
+    Past the API's ceiling that advice is worse than none: following it turns a
+    silent truncation into a 422 on every refresh. Once you are at the wall the
+    only thing that works is asking for a narrower window.
+    """
+    if cfg.activity_max_pages < SEARCH_RESULT_CEILING // _per_page(cfg):
+        return "raise sources.github.activity_max_pages to reach the rest"
+    return (
+        f"that is GitHub's {SEARCH_RESULT_CEILING}-result search limit, not a "
+        f"setting — narrow the window with --days to see further back"
+    )
+
+
 def fetch(
     cfg: GitHubConfig, token: str, since: str
 ) -> tuple[list[ActivityEvent], list[str]]:
@@ -354,32 +513,70 @@ def fetch(
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    per_page = cfg.activity_per_page
+    per_page = _per_page(cfg)
 
     # Ordered: the first search to claim a URL wins in append_events, and
     # "you opened this PR" beats "you commented" as a description of the same PR.
+    # Each carries its own label. Deriving one from the query gave `author:@me`
+    # for both the pull-request and the commit search, so a truncation or error
+    # warning could not say which endpoint it came from — and those two fail for
+    # different reasons and at different rates.
     searches = (
-        ("/search/issues", f"author:@me type:pr updated:>={since}", _as_pr),
-        ("/search/commits", f"author:@me author-date:>={since}", _as_commit),
-        ("/search/issues", f"commenter:@me updated:>={since}", _as_comment),
+        ("pull requests", "/search/issues", f"author:@me type:pr updated:>={since}", _as_pr),
+        ("commits", "/search/commits", f"author:@me author-date:>={since}", _as_commit),
+        ("comments", "/search/issues", f"commenter:@me updated:>={since}", _as_comment),
     )
 
     events: list[ActivityEvent] = []
     errors: list[str] = []
+    notices: list[str] = []
 
     with httpx.Client(base_url=cfg.api_base, headers=headers, timeout=cfg.timeout) as client:
-        for url, query, convert in searches:
-            try:
-                payload = get_json(client, url, {"q": query, "per_page": per_page})
-            except GitHubError as exc:
-                errors.append(f"{query.split()[0]}: {exc}")
-                continue
-            for item in _items(payload):
-                event = convert(item) if isinstance(item, dict) else None
-                if event is not None:
-                    events.append(event)
+        for label, url, query, convert in searches:
+            collected = 0
+            total = None
 
-    return events, errors
+            for page in range(1, _last_page(cfg) + 1):
+                try:
+                    payload = get_json(
+                        client,
+                        url,
+                        {"q": query, "per_page": per_page, "page": page},
+                    )
+                except GitHubError as exc:
+                    # Page 1 failing means this search returned nothing; a later
+                    # page failing still leaves the earlier ones in `events`.
+                    errors.append(f"{label}: {exc}")
+                    break
+
+                if total is None:
+                    total = _total_count(payload)
+
+                items = _items(payload)
+                for item in items:
+                    event = convert(item) if isinstance(item, dict) else None
+                    if event is not None:
+                        events.append(event)
+                collected += len(items)
+
+                # A short page is the last page — asking for another wastes a
+                # request against a rate-limited endpoint.
+                if len(items) < per_page:
+                    break
+
+            # Say so when GitHub had more than we took. Before this, a search
+            # returning exactly `per_page` results looked identical to one that
+            # had exactly that many — 100 commits in a 90-day window was a
+            # ceiling being reported as a count.
+            if total is not None and total > collected:
+                # A *notice*, not an error. Sharing the errors list made a
+                # completely successful refresh report "could not refresh",
+                # which is the opposite of what happened.
+                notices.append(
+                    f"{label}: took {collected} of {total} — {_how_to_get_more(cfg)}"
+                )
+
+    return events, errors + notices
 
 
 def refresh(
@@ -406,6 +603,17 @@ def refresh(
         return RefreshResult(error=f"unexpected: {exc}")
 
     added = append_events(events, path)
+
+    # Housekeeping at the natural mutation point. Not on read: reads happen on
+    # the way to answering a question and must stay cheap, and this is already
+    # the slow path.
+    # Floored, because `activity_days: 0` is a legitimate setting — it means
+    # "show me today" on the read path — and multiplying it gives a keep-window
+    # of zero, which compacts the entire history away. The cache cannot be
+    # rebuilt past GitHub's 1000-result search ceiling, so that is permanent
+    # data loss triggered by a config value we deliberately made valid.
+    keep_days = max(MIN_KEEP_DAYS, cfg.activity_days * KEEP_WINDOW_MULTIPLE)
+    maybe_compact(path, keep_days=keep_days)
 
     # Recorded even on a partial failure: we *did* ask, and the point of the
     # marker is to stop every question re-firing the same searches.

@@ -165,6 +165,29 @@ def route_report(report: SourceReport, config: Config) -> SourceReport:
         )
 
 
+#: A briefing that runs past this many characters did not come back as the four
+#: sentences it was asked for. Four long sentences are ~600 chars, so this is
+#: generous — it is a nonsense detector, not a style rule.
+MAX_BRIEFING_CHARS = 1_200
+
+
+def is_plausible_briefing(text: str) -> bool:
+    """Does this look like the four sentences of prose we asked for?
+
+    On 2026-09-01 a reasoning model answered the fuse prompt with "Here's a
+    thinking process:" and nine paragraphs of deliberation. The call *succeeded*,
+    so no ``except LLMError`` caught it, and the pipeline printed it and handed
+    it to TTS — which would have read the model's private reasoning aloud, for
+    over a minute, on a path where nobody is watching.
+
+    Length is the check because it is the sturdy one. Sniffing for markers
+    (``<think>``, "thinking process") is model-specific and rots the moment a
+    model words it differently; "far longer than four sentences" holds whoever
+    is serving the request.
+    """
+    return len(text) <= MAX_BRIEFING_CHARS
+
+
 def _raw_briefing(reports: list[SourceReport]) -> str:
     """The un-fused fallback, when the brain is unavailable entirely."""
     lines = []
@@ -196,13 +219,37 @@ def fuse(reports: list[SourceReport], config: Config) -> Briefing:
             )
             or ""
         ).strip()
-    except (LLMError, MissingApiKey):
+    except (LLMError, MissingApiKey) as exc:
         # The Voicelog degradation pattern: you still get the information, just
         # unfused. This is the whole reason the raw summaries are kept around.
         return Briefing(
-            briefing_text=_raw_briefing(reports), needs_you=needs_you, context=context
+            briefing_text=_raw_briefing(reports),
+            needs_you=needs_you,
+            context=context,
+            note=f"fuser failed ({exc}); fell back to the raw per-source list",
         )
 
-    return Briefing(
-        briefing_text=text or _raw_briefing(reports), needs_you=needs_you, context=context
-    )
+    if not text:
+        return Briefing(
+            briefing_text=_raw_briefing(reports),
+            needs_you=needs_you,
+            context=context,
+            note="fuser returned nothing; fell back to the raw per-source list",
+        )
+
+    if not is_plausible_briefing(text):
+        # A *successful* call that returned nonsense. Same fallback as a failed
+        # one, because the outcome for the listener is the same — except this
+        # path is worse if unhandled: the text is spoken rather than erroring.
+        return Briefing(
+            briefing_text=_raw_briefing(reports),
+            needs_you=needs_you,
+            context=context,
+            note=(
+                f"fuser returned {len(text)} chars for a four-sentence briefing "
+                f"(limit {MAX_BRIEFING_CHARS}) — looks like reasoning, not prose; "
+                f"fell back to the raw per-source list"
+            ),
+        )
+
+    return Briefing(briefing_text=text, needs_you=needs_you, context=context)

@@ -37,13 +37,59 @@ def test_remember_joins_multiple_words():
     assert memory.read_all()[0].description == "Prefers concise answers"
 
 
-def test_remember_refuses_a_near_duplicate(capsys):
+def test_a_near_duplicate_is_refused_when_nobody_can_answer(capsys):
+    """Piped or scripted, there is no one to ask, so it must not write blind."""
     run("remember", "Builds for Windows first, cross-platform later")
     with pytest.raises(SystemExit) as exit_info:
         run("remember", "He builds for Windows first; cross-platform later")
 
     assert exit_info.value.code == 1
-    assert "already covers" in capsys.readouterr().err
+    assert "--update" in capsys.readouterr().err
+    assert len(memory.read_all()) == 1
+
+
+def duplicate_answering(reply, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda _: reply)
+
+
+def test_a_near_duplicate_offers_to_update_it(monkeypatch):
+    """The paraphrase that started this: 'med-dark roast' vs 'medium-dark
+    roasted' shared only two literal words and sailed through."""
+    run("remember", "I like med-dark roast coffee")
+    duplicate_answering("u", monkeypatch)
+
+    run("remember", "I prefer my coffee medium-dark roasted")
+
+    remaining = memory.read_all()
+    assert len(remaining) == 1
+    assert remaining[0].description == "I prefer my coffee medium-dark roasted"
+
+
+def test_you_can_keep_both(monkeypatch):
+    run("remember", "I like med-dark roast coffee")
+    duplicate_answering("k", monkeypatch)
+
+    run("remember", "I prefer my coffee medium-dark roasted")
+    assert len(memory.read_all()) == 2
+
+
+def test_cancelling_writes_nothing(monkeypatch):
+    run("remember", "I like med-dark roast coffee")
+    duplicate_answering("c", monkeypatch)
+
+    with pytest.raises(SystemExit):
+        run("remember", "I prefer my coffee medium-dark roasted")
+    assert len(memory.read_all()) == 1
+
+
+def test_a_different_fact_on_the_same_topic_is_not_flagged():
+    """The reason this asks instead of refusing: overlap cannot tell a
+    restatement from a contradiction, so the check must not be a verdict."""
+    run("remember", "Builds for Windows first")
+    run("remember", "Tests on Linux CI")
+
+    assert len(memory.read_all()) == 2
 
 
 def test_force_keeps_both(capsys):
@@ -305,3 +351,318 @@ def test_start_exits_one_when_the_target_is_occupied(tmp_path, capsys):
 
     assert exit_info.value.code == 1
     assert "not empty" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# mj do / mj review
+# ---------------------------------------------------------------------------
+
+
+def test_do_turns_a_missing_key_into_an_error_not_a_traceback(capsys, tmp_path):
+    """Found by running it: agent.run swallows LLMError so a half-finished task
+    keeps its trail, but MissingApiKey went straight through as a traceback."""
+    from majordomo.llm import MissingApiKey
+
+    with mock.patch(
+        "majordomo.agent.run", side_effect=MissingApiKey("Set the OPENROUTER_API_KEY")
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            run("do", "something", "-C", str(tmp_path))
+
+    assert exit_info.value.code == 1
+    assert "OPENROUTER_API_KEY" in capsys.readouterr().err
+
+
+def test_do_with_no_task_exits_one(capsys, tmp_path):
+    with pytest.raises(SystemExit):
+        run("do", "   ", "-C", str(tmp_path))
+    assert "do what?" in capsys.readouterr().err
+
+
+def test_do_reports_declined_actions(capsys, tmp_path):
+    from majordomo import agent
+
+    outcome = agent.Outcome(
+        answer="I did not change it.",
+        steps=[agent.Step("write_file", {}, "declined", approved=False)],
+    )
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        run("do", "write", "something", "-C", str(tmp_path))
+
+    captured = capsys.readouterr()
+    assert "I did not change it." in captured.out
+    assert "1 action(s) declined" in captured.err
+
+
+def test_do_reports_why_it_stopped(capsys, tmp_path):
+    from majordomo import agent
+
+    with mock.patch(
+        "majordomo.agent.run",
+        return_value=agent.Outcome(stopped_because="reached the 24-step limit"),
+    ):
+        run("do", "loop", "-C", str(tmp_path))
+
+    assert "24-step limit" in capsys.readouterr().err
+
+
+def test_yes_warns_that_it_skips_every_prompt(capsys, tmp_path):
+    from majordomo import agent
+
+    with mock.patch("majordomo.agent.run", return_value=agent.Outcome(answer="ok")) as ran:
+        run("do", "something", "--yes", "-C", str(tmp_path))
+
+    assert ran.call_args.kwargs["confirm"] is agent.always_allow
+    assert "approves every write" in capsys.readouterr().err
+
+
+def test_review_opens_claude_code_in_the_repo(tmp_path):
+    """Majordomo cannot read code; it opens the reviewer you already have."""
+    with mock.patch("majordomo.resume.spawn_detached") as spawned:
+        run("review", str(tmp_path))
+
+    argv, kwargs = spawned.call_args
+    assert argv[0] == ["claude", "/code-review"]
+    assert kwargs["cwd"] == str(tmp_path.resolve())
+
+
+def test_review_of_a_missing_directory_exits_one(capsys, tmp_path):
+    with pytest.raises(SystemExit):
+        run("review", str(tmp_path / "nope"))
+    assert "no directory" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The edit preview
+# ---------------------------------------------------------------------------
+
+
+def test_an_append_shows_the_appended_lines():
+    """The bug this function exists for: showing the first N lines of each side
+    made an append look like a no-op, because both sides start the same."""
+    old = "def add(a, b):\n    return a + b\n"
+    new = old + "\ndef subtract(a, b):\n    return a - b\n"
+
+    preview = "\n".join(cli._edit_preview(old, new))
+
+    assert "+ def subtract(a, b):" in preview
+    assert "unchanged line(s)" in preview          # the shared prefix, summarised
+    assert "- def add(a, b):" not in preview       # not re-shown as a removal
+
+
+def test_a_change_in_the_middle_shows_both_sides():
+    old = "a\nb\nc\n"
+    new = "a\nB\nc\n"
+
+    preview = cli._edit_preview(old, new)
+
+    assert "- b" in preview and "+ B" in preview
+    assert preview[0] == "  1 unchanged line(s)"
+    assert preview[-1] == "  1 unchanged line(s)"
+
+
+def test_a_long_change_says_how_much_was_elided():
+    """write_file already said '… N more lines'; edit_file silently truncated."""
+    preview = "\n".join(cli._edit_preview("x\n", "\n".join(str(i) for i in range(40))))
+
+    assert "more line(s)" in preview
+    shown = [line for line in preview.splitlines() if line.startswith("+ ")]
+    assert len(shown) == cli.EDIT_PREVIEW_LINES + 1      # +1 for the elision note
+
+
+def test_a_whitespace_only_edit_says_so_rather_than_printing_nothing():
+    assert "no visible change" in "\n".join(cli._edit_preview("a\nb\n", "a\nb"))
+
+
+def test_the_preview_reaches_the_prompt(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+
+    cli.confirm_action(
+        "edit_file",
+        {"path": "adder.py", "old": "def add():\n    pass\n",
+         "new": "def add():\n    pass\n\ndef sub():\n    pass\n"},
+    )
+
+    assert "+ def sub():" in capsys.readouterr().out
+
+
+def test_do_refuses_a_directory_that_does_not_exist(capsys, tmp_path):
+    """write_file creates parents, so an unvalidated -C typo would silently
+    build a whole tree in the wrong place rather than erroring."""
+    with pytest.raises(SystemExit) as exit_info:
+        run("do", "say hello", "-C", str(tmp_path / "typo"))
+
+    assert exit_info.value.code == 1
+    assert "no directory" in capsys.readouterr().err
+
+
+def test_do_refuses_a_file_as_the_project_root(capsys, tmp_path):
+    target = tmp_path / "notes.md"
+    target.write_text("x", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        run("do", "say hello", "-C", str(target))
+    assert "no directory" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# mj mic
+# ---------------------------------------------------------------------------
+
+
+def measured(**overrides):
+    base = {
+        "threshold": 200.0, "min": 10.0, "p10": 30.0, "p50": 400.0,
+        "p90": 900.0, "max": 2000.0, "quiet_fraction": 0.3,
+        "longest_quiet_ms": 600, "stops_at_ms": 1800,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_mic_says_nothing_is_wrong_when_nothing_is(capsys):
+    with mock.patch("majordomo.asr.measure", return_value=measured()):
+        run("mic")
+    assert "healthy" in capsys.readouterr().out
+
+
+def test_mic_spots_a_threshold_above_your_voice(capsys):
+    """The reported symptom: recording stopped after exactly the trailing pause
+    however you spoke, because nothing ever cleared the threshold."""
+    with mock.patch("majordomo.asr.measure", return_value=measured(threshold=1500.0)):
+        run("mic")
+
+    out = capsys.readouterr().out
+    assert "cut you off" in out
+    assert "silence_rms: 164" in out          # between the pauses and the speech
+
+
+def test_mic_spots_a_threshold_below_the_room(capsys):
+    with mock.patch("majordomo.asr.measure", return_value=measured(threshold=5.0)):
+        run("mic")
+
+    out = capsys.readouterr().out
+    assert "never stop" in out
+    assert "silence_rms:" in out
+
+
+def test_mic_does_not_invent_a_number_when_nobody_spoke(capsys):
+    """Suggesting a threshold from room tone alone is how you get told to set
+    one below your own noise floor."""
+    flat = measured(p10=30.0, p50=35.0, p90=45.0, max=90.0, threshold=250.0)
+    with mock.patch("majordomo.asr.measure", return_value=flat):
+        run("mic")
+
+    out = capsys.readouterr().out
+    assert "Nothing here looks like speech" in out
+    assert "silence_rms:" not in out
+
+
+def test_mic_reports_a_missing_microphone_and_exits_one(capsys):
+    from majordomo import asr
+
+    with mock.patch("majordomo.asr.measure", side_effect=asr.MicrophoneUnavailable("no mic")):
+        with pytest.raises(SystemExit) as exit_info:
+            run("mic")
+
+    assert exit_info.value.code == 1
+    assert "no mic" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# mj config
+# ---------------------------------------------------------------------------
+
+
+def test_config_shows_every_role_and_what_it_is_for(capsys):
+    """The models were always config, but nothing said so — they were only
+    visible by reading config.py."""
+    run("config")
+    out = capsys.readouterr().out
+
+    for role in ("worker", "fuser", "reducer", "chat", "agent", "fallback"):
+        assert role in out
+    assert "write the spoken briefing" in out      # not just the role names
+    assert "https://openrouter.ai/api/v1" in out
+
+
+def test_config_says_whether_the_key_is_set(capsys, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    run("config")
+    assert "NOT SET" in capsys.readouterr().out
+
+
+def test_config_init_writes_the_annotated_example(capsys, tmp_path):
+    target = tmp_path / "nested" / "config.yml"
+
+    run("--config", str(target), "config", "--init")
+
+    assert "fuser_model" in target.read_text(encoding="utf-8")
+    assert "Wrote" in capsys.readouterr().out
+
+
+def test_config_init_refuses_to_clobber(capsys, tmp_path):
+    target = tmp_path / "config.yml"
+    target.write_text("brain:\n  chat_model: mine\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exit_info:
+        run("--config", str(target), "config", "--init")
+
+    assert exit_info.value.code == 1
+    assert "already exists" in capsys.readouterr().err
+    assert "mine" in target.read_text(encoding="utf-8")
+
+
+def test_config_init_force_overwrites(tmp_path):
+    target = tmp_path / "config.yml"
+    target.write_text("brain:\n  chat_model: mine\n", encoding="utf-8")
+
+    run("--config", str(target), "config", "--init", "--force")
+
+    assert "fuser_model" in target.read_text(encoding="utf-8")
+
+
+def test_what_init_writes_is_loadable(tmp_path):
+    """An example that does not parse is worse than no example."""
+    from majordomo import config as config_module
+
+    target = tmp_path / "config.yml"
+    run("--config", str(target), "config", "--init")
+
+    assert config_module.load(str(target)).brain.fuser_model
+
+
+def test_a_non_interactive_run_says_so_instead_of_declining_everything(capsys, monkeypatch):
+    """Piped, nobody can answer, so every gated call was declined and the agent
+    spent its whole turn budget being told no — for no visible reason."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.confirm_action("write_file", {"path": "a.txt", "content": "x"})
+
+    assert exit_info.value.code == 1
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_do_warns_when_the_agent_says_nothing(capsys, tmp_path):
+    """No answer, no error, exit 0 — indistinguishable from a task that needed
+    no output. chat.send has guarded this with '(empty response)' all along."""
+    from majordomo import agent
+
+    with mock.patch("majordomo.agent.run", return_value=agent.Outcome()):
+        run("do", "something", "-C", str(tmp_path))
+
+    assert "without saying anything" in capsys.readouterr().err
+
+
+def test_do_does_not_double_warn_when_it_stopped_for_a_reason(capsys, tmp_path):
+    from majordomo import agent
+
+    outcome = agent.Outcome(stopped_because="reached the 24-step limit")
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        run("do", "loop", "-C", str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "24-step limit" in err
+    assert "without saying anything" not in err

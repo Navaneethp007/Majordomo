@@ -15,6 +15,7 @@ import pytest
 
 from majordomo import activity, chat, context, memory, prompts, scaffold
 from majordomo import config as config_module
+from majordomo.paths import chats_dir
 
 CFG = config_module.build(config_module.DEFAULTS)
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -236,7 +237,7 @@ def test_an_empty_reply_is_labelled_rather_than_stored_blank():
 
 def test_transcript_round_trip(tmp_path):
     session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
-    session.turns = [chat.Turn("user", "one"), chat.Turn("assistant", "two")]
+    session.log = [chat.Turn("user", "one"), chat.Turn("assistant", "two")]
     chat.save(session)
 
     restored = chat.load_turns(session.path)
@@ -397,3 +398,520 @@ def test_brief_omits_empty_sections():
 def test_slug_is_filesystem_safe():
     assert scaffold.slug("A CLI that diffs two JSON files!") == "a-cli-that-diffs-two-json-files"
     assert scaffold.slug("???") == "project"
+
+
+# ---------------------------------------------------------------------------
+# /clear and session selection
+# ---------------------------------------------------------------------------
+
+def test_clear_empties_the_turns_but_keeps_the_frozen_prefix():
+    """Rebuilding the prefix would reread memory and activity and produce
+    different bytes — which is exactly the caching guarantee context.py exists
+    to hold. Clearing is about the turns."""
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "one")], compactions=2)
+    before = session.system
+    old_path = session.path
+
+    chat.clear(session)
+
+    assert session.turns == []
+    assert session.compactions == 0
+    assert session.system == before
+    assert session.path != old_path          # a new transcript, not an overwrite
+
+
+def test_clear_starts_a_new_transcript_file(tmp_path):
+    session = chat.Session(system="SYS", path=tmp_path / "old.jsonl")
+    session.log = [chat.Turn("user", "kept")]
+    chat.save(session)
+
+    chat.clear(session)
+    chat.save(session)
+
+    assert chat.load_turns(tmp_path / "old.jsonl")[0].content == "kept"
+    assert chat.load_turns(session.path) == []
+
+
+def test_saved_sessions_is_oldest_first_and_never_raises():
+    assert chat.saved_sessions() == []        # no chats dir yet
+
+    for stamp in ("20260901-100000", "20260903-100000", "20260902-100000"):
+        path = chats_dir() / f"{stamp}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"role":"user","content":"x"}\n', encoding="utf-8")
+
+    assert [p.stem for p in chat.saved_sessions()] == [
+        "20260901-100000", "20260902-100000", "20260903-100000"
+    ]
+    assert chat.latest_transcript().stem == "20260903-100000"
+
+
+def _saved(stem, turns=1):
+    path = chats_dir() / f"{stem}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join('{"role":"user","content":"a question"}\n' for _ in range(turns)),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_find_session_matches_a_unique_prefix():
+    _saved("20260901-100000")
+    _saved("20260903-120000")
+
+    assert chat.find_session("20260901").stem == "20260901-100000"
+    assert chat.find_session("20260903-12").stem == "20260903-120000"
+
+
+def test_find_session_refuses_an_ambiguous_prefix():
+    """Returning the first match would silently open the wrong conversation."""
+    _saved("20260901-100000")
+    _saved("20260901-110000")
+
+    assert chat.find_session("20260901") is None
+    assert chat.match_count("20260901") == 2
+
+
+def test_find_session_on_no_match():
+    assert chat.find_session("nope") is None
+    assert chat.match_count("nope") == 0
+
+
+def test_describe_session_shows_the_opening_question():
+    path = _saved("20260901-100000", turns=3)
+    line = chat.describe_session(path)
+
+    assert "20260901-100000" in line
+    assert "3 turns" in line
+    assert "a question" in line
+
+
+def test_new_session_can_open_a_named_transcript(populated):
+    path = _saved("20260901-100000", turns=2)
+    session = chat.new_session(CFG, transcript=path)
+
+    assert len(session.turns) == 2
+    assert session.path == path
+
+
+def test_new_session_without_resume_starts_empty(populated):
+    _saved("20260901-100000", turns=5)
+    assert chat.new_session(CFG).turns == []
+
+
+# ---------------------------------------------------------------------------
+# Compaction: the failures found by actually driving it
+# ---------------------------------------------------------------------------
+
+
+def sized(role: str, tokens: int) -> chat.Turn:
+    return chat.Turn(role, "x" * (tokens * 4))
+
+
+def small_threshold(tokens: int):
+    return config_module.build(
+        {**config_module.DEFAULTS, "brain": {"chat_compact_threshold_tokens": tokens}}
+    )
+
+
+def test_few_but_huge_turns_can_still_compact():
+    """The bug: compaction *triggered* on tokens but was *guarded* on turn
+    count, so four pasted files crossed the threshold, hit a `<= 10 turns`
+    guard, and could never compact. The conversation just grew until the
+    provider rejected it."""
+    config = small_threshold(2_000)
+    session = chat.Session(
+        system="SYS", turns=[sized("user", 1_500), sized("assistant", 1_500),
+                             sized("user", 1_500), sized("assistant", 1_500)]
+    )
+    assert chat.needs_compaction(session, config)
+
+    with mock.patch("majordomo.llm.complete", return_value="notes"):
+        assert chat.compact(session, config) is True
+
+    assert chat.estimate_tokens(session) < 4_000
+
+
+def test_the_current_exchange_is_never_folded_away():
+    """Compaction that eats the question produces a model answering something
+    nobody asked."""
+    config = small_threshold(100)
+    session = chat.Session(
+        system="SYS",
+        turns=[sized("user", 900), sized("assistant", 900),
+               chat.Turn("user", "the actual question")],
+    )
+
+    assert chat._recent_to_keep(session, config) >= chat.MIN_RECENT_TURNS
+
+    with mock.patch("majordomo.llm.complete", return_value="notes"):
+        chat.compact(session, config)
+
+    assert session.turns[-1].content == "the actual question"
+
+
+def test_an_existing_summary_is_carried_not_resummarised():
+    """Re-summarising the summary is a telephone game: measured live, a fact
+    stated in turn one survived the first compaction and was gone by the
+    third."""
+    config = small_threshold(500)
+    session = chat.Session(
+        system="SYS",
+        turns=[
+            chat.Turn("user", f"{chat.SUMMARY_MARKER}\n\nCat named Pilot, a tabby."),
+            sized("assistant", 2_000),
+            sized("user", 2_000),
+            sized("assistant", 2_000),
+        ],
+    )
+
+    with mock.patch("majordomo.llm.complete", return_value="notes") as called:
+        chat.compact(session, config)
+
+    prompt = called.call_args[0][0][0]["content"]
+    assert "Cat named Pilot" in prompt
+    assert "existing notes" in prompt.lower()
+    # and it is presented as established fact, not as more conversation to fold
+    assert "Reproduce every fact" in prompt
+
+
+def test_nothing_new_to_fold_leaves_the_notes_alone():
+    config = small_threshold(1)
+    session = chat.Session(
+        system="SYS",
+        turns=[
+            chat.Turn("user", f"{chat.SUMMARY_MARKER}\n\nNotes."),
+            chat.Turn("assistant", "a"),
+            chat.Turn("user", "b"),
+        ],
+    )
+
+    with mock.patch("majordomo.llm.complete") as called:
+        assert chat.compact(session, config) is False
+    called.assert_not_called()
+
+
+def test_the_summary_prompt_asks_for_facts_about_the_user():
+    """It used to ask only for 'decisions and constraints', so a stated fact —
+    the thing a personal assistant exists to retain — was correctly dropped."""
+    config = small_threshold(10)
+    session = chat.Session(
+        system="SYS", turns=[sized("user", 100), sized("assistant", 100),
+                             chat.Turn("user", "q"), chat.Turn("assistant", "a")]
+    )
+
+    with mock.patch("majordomo.llm.complete", return_value="notes") as called:
+        chat.compact(session, config)
+
+    prompt = called.call_args[0][0][0]["content"].lower()
+    assert "about themselves" in prompt
+    assert "anything they said to remember" in prompt
+
+
+def test_a_failed_compaction_is_recorded_rather_than_discarded():
+    """send() used to call compact() and ignore the result, so the one problem
+    that compounds every turn was the one nothing reported."""
+    config = small_threshold(10)
+    session = chat.Session(system="SYS", turns=[])
+
+    with mock.patch("majordomo.llm.complete", side_effect=["", "reply"]):
+        chat.send(session, "x" * 400, config)
+
+    assert session.compaction_failed is True
+
+
+def test_a_successful_compaction_clears_the_flag():
+    config = small_threshold(10)
+    session = chat.Session(system="SYS", turns=[sized("user", 50), sized("assistant", 50),
+                                                sized("user", 50), sized("assistant", 50)])
+    session.compaction_failed = True
+
+    with mock.patch("majordomo.llm.complete", side_effect=["notes", "reply"]):
+        chat.send(session, "next", config)
+
+    assert session.compaction_failed is False
+
+
+def test_clear_resets_the_failure_flag():
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "x")])
+    session.compaction_failed = True
+    session.compactions = 3
+
+    chat.clear(session)
+
+    assert session.compaction_failed is False
+    assert session.compactions == 0
+    assert session.system == "SYS"      # the frozen prefix survives
+
+
+def test_compaction_does_not_destroy_the_saved_transcript(tmp_path):
+    """save() used to write `turns`, which compaction shrinks — so folding a
+    pasted file out of context also overwrote it on disk. Losing it from
+    context is the feature; losing it from disk was data loss."""
+    config = small_threshold(10)
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+
+    with mock.patch("majordomo.llm.complete", side_effect=["reply one", "notes", "reply two"]):
+        chat.send(session, "a very long pasted file " * 50, config)
+        chat.save(session)
+        chat.send(session, "and a follow-up", config)
+        chat.save(session)
+
+    assert session.compactions == 1                          # it really did compact
+    assert session.turns[0].content.startswith(chat.SUMMARY_MARKER)   # context folded
+    assert "a very long pasted file" in session.log[0].content        # record intact
+
+    saved = chat.load_turns(session.path)
+    assert any("a very long pasted file" in t.content for t in saved)
+
+
+def test_a_failed_call_writes_nothing_to_the_log():
+    """The user turn is rolled out of context on failure; the record must not
+    keep a question that was never answered."""
+    from majordomo.llm import LLMError
+
+    config = small_threshold(100_000)
+    session = chat.Session(system="SYS")
+
+    with mock.patch("majordomo.llm.complete", side_effect=LLMError("503")):
+        with pytest.raises(chat.ChatFailed):
+            chat.send(session, "unanswered", config)
+
+    assert session.log == []
+    assert session.turns == []
+
+
+def test_resuming_restores_both_the_context_and_the_record(tmp_path, monkeypatch):
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+    session.log = [chat.Turn("user", "one"), chat.Turn("assistant", "two")]
+    chat.save(session)
+
+    resumed = chat.new_session(CFG, transcript=session.path)
+
+    assert [t.content for t in resumed.turns] == ["one", "two"]
+    assert [t.content for t in resumed.log] == ["one", "two"]
+
+
+# ---------------------------------------------------------------------------
+# /agent inside a conversation
+# ---------------------------------------------------------------------------
+
+
+def handle(line, session, config=CFG):
+    written = []
+    ended = chat._handle_command(line, session, config, written.append)
+    return ended, "\n".join(written)
+
+
+def test_a_missing_key_does_not_kill_the_repl(tmp_path):
+    """MissingApiKey is a bare Exception, not an LLMError, so agent.run's
+    handler missed it and it propagated out through _handle_command — taking
+    the conversation with it. cmd_do guards the identical call."""
+    from majordomo.llm import MissingApiKey
+
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+    session.turns = [chat.Turn("user", "earlier")]
+    session.log = [chat.Turn("user", "earlier")]
+
+    with mock.patch("majordomo.agent.run", side_effect=MissingApiKey("Set OPENROUTER_API_KEY")):
+        ended, written = handle("/agent do something", session)
+
+    assert ended is False                        # back to the prompt
+    assert "OPENROUTER_API_KEY" in written
+    assert session.turns[0].content == "earlier"  # conversation intact
+
+
+def test_agent_turns_reach_the_saved_transcript(tmp_path):
+    """save() writes `log`, so appending to `turns` alone silently dropped the
+    agent's work from the transcript."""
+    from majordomo import agent as agent_mod
+
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+    outcome = agent_mod.Outcome(answer="Added the docstring.")
+
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        handle("/agent add a docstring", session)
+
+    saved = [t.content for t in chat.load_turns(session.path)]
+    assert any("add a docstring" in c for c in saved)
+    assert "Added the docstring." in saved
+    assert [t.content for t in session.turns] == saved   # context and record agree
+
+
+def test_an_agent_that_stopped_early_is_still_recorded(tmp_path):
+    from majordomo import agent as agent_mod
+
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+    outcome = agent_mod.Outcome(stopped_because="reached the 24-step limit")
+
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        _, written = handle("/agent loop forever", session)
+
+    assert "24-step limit" in written
+    assert "24-step limit" in chat.load_turns(session.path)[-1].content
+
+
+def test_quitting_without_typing_writes_no_transcript(tmp_path, monkeypatch):
+    """An empty transcript still sorts newest by mtime, so opening the REPL and
+    quitting made *that* the latest session — and --resume then restored nothing
+    over yesterday's conversation."""
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    yesterday = tmp_path / "20260901-120000.jsonl"
+    yesterday.write_text('{"role": "user", "content": "real work", "at": ""}\n', encoding="utf-8")
+
+    session = chat.Session(system="SYS", path=tmp_path / "20260902-120000.jsonl")
+    with mock.patch.object(chat, "new_session", return_value=session):
+        with mock.patch("majordomo.keys.read_line", side_effect=EOFError):
+            chat.run(CFG)
+
+    assert not session.path.exists()
+    assert chat.latest_transcript() == yesterday
+
+
+def test_a_conversation_is_still_saved_on_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+    session.log = [chat.Turn("user", "something real")]
+
+    with mock.patch.object(chat, "new_session", return_value=session):
+        with mock.patch("majordomo.keys.read_line", side_effect=EOFError):
+            with mock.patch.object(chat, "_offer_memories"):
+                chat.run(CFG)
+
+    assert "something real" in chat.load_turns(session.path)[0].content
+
+
+def test_a_compacted_conversation_is_still_saved(tmp_path, monkeypatch):
+    """Guarding on `turns` rather than `log` would skip saving a long
+    conversation that had just been folded down."""
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
+    session.log = [chat.Turn("user", "hours of work")]
+    session.turns = []                       # as if compaction emptied it
+
+    with mock.patch.object(chat, "new_session", return_value=session):
+        with mock.patch("majordomo.keys.read_line", side_effect=EOFError):
+            with mock.patch.object(chat, "_offer_memories"):
+                chat.run(CFG)
+
+    assert session.path.exists()
+
+
+def test_resume_skips_an_empty_transcript(tmp_path, monkeypatch):
+    """`run` no longer writes empty ones, but any already on disk would still
+    sort newest and shadow real work — and resuming nothing is worse than
+    reaching one file further back."""
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    real = tmp_path / "20260901-120000.jsonl"
+    real.write_text('{"role": "user", "content": "real", "at": ""}\n', encoding="utf-8")
+    (tmp_path / "20260902-120000.jsonl").write_text("", encoding="utf-8")
+
+    assert chat.latest_transcript() == real
+
+
+def test_an_empty_transcript_is_ignored_not_deleted(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    (tmp_path / "20260901-120000.jsonl").write_text("x", encoding="utf-8")
+    empty = tmp_path / "20260902-120000.jsonl"
+    empty.write_text("", encoding="utf-8")
+
+    chat.latest_transcript()
+
+    assert empty.exists()                       # yours to remove, not ours
+    assert len(chat.saved_sessions()) == 2      # --list still shows both
+
+
+def test_no_transcripts_at_all_resumes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    assert chat.latest_transcript() is None
+
+
+# ---------------------------------------------------------------------------
+# The REPL survives a missing key, and the record outlives compaction
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_key_does_not_kill_an_ordinary_message():
+    """cmd_do and /agent were both guarded; `send` — every message you type —
+    was not, so the first one with no key killed the REPL and the exit-path
+    save() never ran."""
+    from majordomo.llm import MissingApiKey
+
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "earlier")])
+
+    with mock.patch("majordomo.llm.complete", side_effect=MissingApiKey("Set OPENROUTER_API_KEY")):
+        with pytest.raises(chat.ChatFailed) as exc_info:
+            chat.send(session, "hello", CFG)
+
+    assert "OPENROUTER_API_KEY" in str(exc_info.value)     # still fixable
+    assert [t.content for t in session.turns] == ["earlier"]   # rolled back
+
+
+def test_a_missing_key_during_compaction_is_not_fatal():
+    from majordomo.llm import MissingApiKey
+
+    config = small_threshold(10)
+    session = chat.Session(
+        system="SYS",
+        turns=[sized("user", 50), sized("assistant", 50), sized("user", 50),
+               sized("assistant", 50)],
+    )
+
+    with mock.patch("majordomo.llm.complete", side_effect=MissingApiKey("no key")):
+        assert chat.compact(session, config) is False
+
+    assert len(session.turns) == 4          # nothing lost
+
+
+def test_the_transcript_is_what_was_said_not_the_summary():
+    """It feeds /remember and /build — the two moments a session decides what
+    to keep permanently. A summary is the wrong input at exactly that point."""
+    session = chat.Session(system="SYS")
+    session.log = [chat.Turn("user", "I prefer dark roast"),
+                   chat.Turn("assistant", "Noted.")]
+    session.turns = [chat.Turn("user", f"{chat.SUMMARY_MARKER}\n\nlikes coffee")]
+
+    text = session.transcript()
+
+    assert "I prefer dark roast" in text
+    assert chat.SUMMARY_MARKER not in text
+
+
+def test_a_session_with_no_log_still_has_a_transcript():
+    """Constructed by hand, as much of the test suite does."""
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "hi")])
+    assert "hi" in session.transcript()
+
+
+def test_resuming_a_long_conversation_compacts_before_the_first_message(tmp_path, monkeypatch):
+    """The file is the record and is never compacted, so a resumed chat arrives
+    at full length. Folding it on the first message means re-sending the whole
+    history once, at full price, before deciding it was too long."""
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    path = tmp_path / "c.jsonl"
+    big = chat.Session(system="SYS", path=path)
+    big.log = [sized("user", 400), sized("assistant", 400)] * 6
+    chat.save(big)
+
+    config = small_threshold(2_000)
+    with mock.patch("majordomo.llm.complete", return_value="notes"):
+        resumed = chat.new_session(config, transcript=path)
+
+    assert resumed.compactions == 1
+    assert chat.estimate_tokens(resumed) < 4_800
+    assert len(resumed.log) == 12          # the record is untouched
+
+
+def test_resuming_a_short_conversation_does_not_compact(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    path = tmp_path / "c.jsonl"
+    small = chat.Session(system="SYS", path=path)
+    small.log = [chat.Turn("user", "hi"), chat.Turn("assistant", "hello")]
+    chat.save(small)
+
+    with mock.patch("majordomo.llm.complete") as called:
+        resumed = chat.new_session(CFG, transcript=path)
+
+    called.assert_not_called()
+    assert len(resumed.turns) == 2

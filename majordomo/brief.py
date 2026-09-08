@@ -36,6 +36,11 @@ class BriefResult:
         lines = ["Routing:"]
         for report in self.reports:
             lines.append(f"  {report.source:<10} {report.path:<10} {report.route_reason}")
+        if self.briefing.note:
+            # The fusing step belongs to no source, so it has nowhere else to
+            # report from — and a fallback briefing otherwise looks exactly like
+            # a successful terse one.
+            lines.append(f"  {'fuse':<10} {'degraded':<10} {self.briefing.note}")
         return "\n".join(lines)
 
 

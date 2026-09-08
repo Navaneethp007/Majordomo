@@ -378,3 +378,70 @@ def test_an_unreadable_wav_does_not_hang_playback(monkeypatch):
 
     tts._play("clip.wav")          # must return promptly
     assert winsound.PlaySound.called
+
+
+# ---------------------------------------------------------------------------
+# Interruptible playback must not truncate the briefing
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreadable_header_plays_blocking_rather_than_returning_at_once():
+    """The poll deadline comes from the WAV header. When that read failed the
+    duration was 0, the wait loop exited immediately, and speak()'s `finally`
+    deleted the file while SND_ASYNC was still playing it — so the briefing
+    stopped after a fraction of a second, with no error."""
+    winsound = mock.MagicMock()
+    winsound.SND_FILENAME = 1
+    winsound.SND_ASYNC = 2
+    winsound.SND_PURGE = 4
+
+    with mock.patch.dict("sys.modules", {"winsound": winsound}), \
+         mock.patch.object(tts.platform, "system", return_value="Windows"), \
+         mock.patch.object(tts.wave, "open", side_effect=tts.wave.Error("bad header")):
+        tts._play("nowhere.wav")
+
+    (path, flags), _ = winsound.PlaySound.call_args
+    assert path == "nowhere.wav"
+    assert not flags & winsound.SND_ASYNC     # blocking: it plays to the end
+
+
+def test_a_readable_header_still_polls_so_ctrl_c_works():
+    winsound = mock.MagicMock()
+    winsound.SND_FILENAME = 1
+    winsound.SND_ASYNC = 2
+
+    handle = mock.MagicMock()
+    handle.__enter__ = lambda self: self
+    handle.__exit__ = lambda self, *a: False
+    handle.getframerate.return_value = 16000
+    handle.getnframes.return_value = 1600          # 0.1s
+
+    with mock.patch.dict("sys.modules", {"winsound": winsound}), \
+         mock.patch.object(tts.platform, "system", return_value="Windows"), \
+         mock.patch.object(tts.wave, "open", return_value=handle):
+        tts._play("clip.wav")
+
+    (_, flags), _ = winsound.PlaySound.call_args
+    assert flags & winsound.SND_ASYNC
+
+
+def test_ctrl_c_during_playback_stops_the_sound():
+    winsound = mock.MagicMock()
+    winsound.SND_FILENAME = 1
+    winsound.SND_ASYNC = 2
+    winsound.SND_PURGE = 4
+
+    handle = mock.MagicMock()
+    handle.__enter__ = lambda self: self
+    handle.__exit__ = lambda self, *a: False
+    handle.getframerate.return_value = 16000
+    handle.getnframes.return_value = 16000 * 10    # 10s
+
+    with mock.patch.dict("sys.modules", {"winsound": winsound}), \
+         mock.patch.object(tts.platform, "system", return_value="Windows"), \
+         mock.patch.object(tts.wave, "open", return_value=handle), \
+         mock.patch.object(tts.time, "sleep", side_effect=KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            tts._play("clip.wav")
+
+    assert winsound.PlaySound.call_args == mock.call(None, winsound.SND_PURGE)
