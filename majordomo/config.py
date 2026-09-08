@@ -33,21 +33,59 @@ DEFAULTS: dict[str, Any] = {
         "provider": "openrouter",
         "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
-        # Per-role models, so the escalation agent can be a different (bigger)
-        # model than the fuser without touching code. Verified present on
-        # OpenRouter's free tier as of 2026-08; re-check with
-        # `curl https://openrouter.ai/api/v1/models` if a call 404s.
+        # Per-role models, so each job gets the right shape without touching
+        # code. Every one below was chosen by running the *actual prompt for
+        # that role* — a model card says nothing useful here. Two lessons paid
+        # for on 2026-09-05:
         #
-        # The fuser writes four sentences of prose — a small fast model is the
-        # right shape. The reducer reads oversized payloads and extracts from
-        # them, which is the harder job, so it gets the larger model.
-        "fuser_model": "google/gemma-4-26b-a4b-it:free",
+        #   - "high-throughput agentic" can mean a reasoning model that emits
+        #     its chain of thought. nemotron-3.5-lightning answered the fuse
+        #     prompt with nine paragraphs of deliberation, which would have been
+        #     read aloud. It is excellent at tool calling and wrong for prose.
+        #   - "free" does not mean reachable. thinkingmachines/inkling:free
+        #     returns a hard 403 — it is gated to partner apps.
+        #
+        # Deliberately two providers. Gemma 429'd across every role at once when
+        # they were all Google-served; one busy pool should not be able to do
+        # that.
+
+        # Compression, once per source. A trivial job that runs on every wake:
+        # speed and availability matter, depth does not.
+        "worker_model": "dots-studio/dots-3-note-preview:free",
+        # Four sentences of spoken prose. Chosen for instruction-following, not
+        # speed: given an empty DECISIONS block and tempting CONTEXT, it has to
+        # say "nothing needs you" rather than promote something. Minimax failed
+        # that; every model here was re-tested against it on 2026-09-08 and
+        # passed. Latency matters least in this role — the briefing is spoken
+        # while you are walking back to the desk, not typed at.
+        "fuser_model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        # The escalation path: read an oversized payload in chunks and extract
+        # what matters. Also unattended, so the same reasoning applies.
         "reducer_model": "nvidia/nemotron-3-super-120b-a12b:free",
-        "worker_model": "google/gemma-4-26b-a4b-it:free",
         # `mj ask` and `mj chat`. A different job from the briefing roles: those
         # compress a payload once, this has to hold a thread across twenty turns
-        # and disagree with you. Picked for multi-turn tuning rather than speed.
-        "chat_model": "minimax/minimax-m3:free",
+        # and disagree with you — and you are sitting there while it does, so
+        # consistency beats peak quality. Measured over three runs on
+        # 2026-09-08: this one 2.0–2.5s, nemotron-ultra 0.7–31.4s. The tail is
+        # what you feel.
+        "chat_model": "dots-studio/dots-3-note-preview:free",
+        # `mj do` and `/agent`. Split from chat_model because the two roles want
+        # different things: chat wants a model that talks like a colleague,
+        # while the agent wants one that writes code and calls tools reliably —
+        # and the agent runs many turns, so its latency compounds where chat's
+        # does not. Empty means "use chat_model", which is what it did before
+        # this existed.
+        "agent_model": "poolside/laguna-s-2.1:free",
+        # Tried once, for any role, when its own model fails a retryable way.
+        #
+        # This exists because free tiers move underneath you. On 2026-09-08
+        # every model this file previously named had stopped being free —
+        # minimax returned "This model is unavailable for free" and GLM had left
+        # the free list entirely. A fallback on a different provider is what
+        # keeps one such change from taking out every role at once.
+        #
+        # Set to "" to disable. A fallback equal to the primary is skipped.
+        "fallback_model": "nvidia/nemotron-3-ultra-550b-a55b:free",
         # When a chat's total context passes this, fold the oldest turns into a
         # summary and keep the recent ones verbatim. The working set is expected
         # around 20k; this is the alarm, not the target.
@@ -82,6 +120,41 @@ DEFAULTS: dict[str, Any] = {
         # session aloud, and a cold boot says everything twice (OnLogon then
         # OnBoot a minute later).
         "repeat_after_minutes": 120,
+
+        # ── Speech *in*, as opposed to out ──────────────────────────────────
+        # Riva does ASR as well as TTS: same endpoint, same key, same package.
+        # What differs is the NVCF function — each model is its own function id,
+        # so this cannot be inferred from the TTS one and must be set. Find it
+        # on the model's page at build.nvidia.com.
+        "asr_function_id": "",
+        # Blank means "same as voice.provider". Kept separate so speech in and
+        # speech out can come from different vendors without a second config
+        # section — you might want a local Whisper reading a cloud voice.
+        "asr_provider": "",
+        "asr_language": "en-US",
+        # 16kHz is the ASR standard and a quarter the bytes of the TTS rate.
+        # Speech recognition gains nothing from the extra bandwidth.
+        "asr_sample_rate": 16000,
+        # A hard cap on one utterance. Recording normally stops when you stop
+        # talking; this is the backstop for a noisy room, where silence
+        # detection never triggers and a recorder that never stops is worse
+        # than one that stops early.
+        "listen_max_seconds": 30.0,
+        # The key that starts listening from the chat prompt, as a raw control
+        # character. Default is Ctrl+N (\x0e).
+        #
+        # NOT Ctrl+M: that is byte 13, which is exactly what Enter sends — a
+        # terminal cannot tell them apart, so binding it would make Enter
+        # start recording.
+        "listen_key": "\x0e",
+        # How long a pause means "I have finished" rather than "I am
+        # thinking". 0 uses asr.TRAILING_SILENCE_MS. Raise it if you
+        # pause mid-sentence around fillers; lower it if it feels slow.
+        "trailing_silence_ms": 0,
+        # RMS below which a 30ms chunk counts as quiet. 0 uses
+        # asr.SILENCE_RMS. Raise it in a noisy room, where background
+        # sound keeps the recorder alive; lower it for a soft voice.
+        "silence_rms": 0,
     },
     "sources": {
         "github": {
@@ -94,9 +167,20 @@ DEFAULTS: dict[str, Any] = {
             # considered current on read. Older entries stay on disk — pruning
             # happens at read time, not by rewriting the log.
             "activity_days": 90,
-            # Per-search cap. The window already bounds this; the cap is what
-            # stops a pathological month from becoming an unbounded fetch.
+            # Results per request. 100 is GitHub's maximum.
             "activity_per_page": 100,
+            # How many pages to walk per search, so 5 x 100 = 500 each.
+            #
+            # Set from measurement, not taste: one real 90-day window here held
+            # 319 commits, so the first guess of 3 pages still truncated. Five
+            # covers a busy quarter with headroom.
+            #
+            # Bounded on purpose. GitHub caps search at 1000 results however
+            # many pages you ask for, and an unbounded loop against a
+            # rate-limited endpoint turns a refresh into a stall. When a search
+            # still has more than this, `mj activity --refresh` says so rather
+            # than silently reporting a ceiling as a count.
+            "activity_max_pages": 5,
         },
         "gmail": {
             # A digest source: it never contributes needs-you items.
@@ -182,7 +266,9 @@ class BrainConfig:
     timeout: float
     temperature: float
     # Defaulted so every existing construction of BrainConfig keeps working.
-    chat_model: str = "minimax/minimax-m3:free"
+    chat_model: str = "dots-studio/dots-3-note-preview:free"
+    agent_model: str = "poolside/laguna-s-2.1:free"
+    fallback_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     chat_compact_threshold_tokens: int = 32_000
 
 
@@ -199,6 +285,18 @@ class VoiceConfig:
     function_id: str = ""
     language: str = "en-US"
     sample_rate: int = 44100
+    # Speech in. Defaulted so nothing that builds a VoiceConfig by hand breaks.
+    asr_function_id: str = ""
+    asr_provider: str = ""
+    asr_language: str = "en-US"
+    asr_sample_rate: int = 16000
+    listen_max_seconds: float = 30.0
+    listen_key: str = ""
+    # 0 means "use the module default". Both depend on the speaker and the
+    # room, which no default can know: how long a thinking pause runs before
+    # it means "I have finished", and how quiet the room actually is.
+    trailing_silence_ms: int = 0
+    silence_rms: int = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +307,7 @@ class GitHubConfig:
     timeout: float
     activity_days: int = 90
     activity_per_page: int = 100
+    activity_max_pages: int = 5
 
 
 @dataclass(frozen=True)
@@ -348,6 +447,8 @@ def build(data: dict[str, Any]) -> Config:
             reducer_model=str(brain.get("reducer_model", d_brain["reducer_model"])),
             worker_model=str(brain.get("worker_model", d_brain["worker_model"])),
             chat_model=str(brain.get("chat_model", d_brain["chat_model"])),
+            agent_model=str(brain.get("agent_model", d_brain["agent_model"])),
+            fallback_model=str(brain.get("fallback_model", d_brain["fallback_model"])),
             chat_compact_threshold_tokens=int(
                 brain.get(
                     "chat_compact_threshold_tokens",
@@ -370,6 +471,16 @@ def build(data: dict[str, Any]) -> Config:
             function_id=str(voice.get("function_id", d_voice["function_id"])),
             language=str(voice.get("language", d_voice["language"])),
             sample_rate=int(voice.get("sample_rate", d_voice["sample_rate"])),
+            asr_function_id=str(voice.get("asr_function_id", d_voice["asr_function_id"])),
+            asr_provider=str(voice.get("asr_provider", d_voice["asr_provider"])),
+            asr_language=str(voice.get("asr_language", d_voice["asr_language"])),
+            asr_sample_rate=int(voice.get("asr_sample_rate", d_voice["asr_sample_rate"])),
+            listen_max_seconds=float(voice.get("listen_max_seconds", d_voice["listen_max_seconds"])),
+            listen_key=str(voice.get("listen_key", d_voice["listen_key"])),
+            trailing_silence_ms=int(
+                voice.get("trailing_silence_ms", d_voice["trailing_silence_ms"])
+            ),
+            silence_rms=int(voice.get("silence_rms", d_voice["silence_rms"])),
         ),
         sources=SourcesConfig(
             github=GitHubConfig(
@@ -382,6 +493,9 @@ def build(data: dict[str, Any]) -> Config:
                 ),
                 activity_per_page=int(
                     github.get("activity_per_page", d_github["activity_per_page"])
+                ),
+                activity_max_pages=int(
+                    github.get("activity_max_pages", d_github["activity_max_pages"])
                 ),
             ),
             gmail=GmailConfig(

@@ -1,0 +1,222 @@
+# Majordomo configuration — copy to ~/.majordomo/config.yml and edit.
+#
+#   mj config --init        writes this file there for you
+#   mj config               shows which file is in use and what it resolved to
+#
+# Everything here is optional. Delete any key and its default applies; delete
+# the whole file and Majordomo still runs. Only set what you want to change.
+#
+# API keys do NOT go in this file. They go in ~/.majordomo/.env, or in your
+# environment — this file names the *variable*, never the value, so it stays
+# safe to commit or paste into an issue.
+
+# ---------------------------------------------------------------------------
+# brain — where the thinking happens
+# ---------------------------------------------------------------------------
+#
+# Majordomo talks to one OpenAI-compatible /chat/completions endpoint, under
+# several different roles. Each role is a separate model id, because the roles
+# genuinely want different things and one model is rarely best at all of them.
+#
+# THE ROLES, and what each is actually optimising for:
+#
+#   worker_model    Compresses one source's raw payload into a short summary.
+#                   A small, mechanical job run once per source. Wants speed and
+#                   obedience; reasoning is wasted here.
+#
+#   fuser_model     Turns those summaries into the four sentences you hear
+#                   spoken. THE ROLE THAT MATTERS MOST for correctness. It is
+#                   given a DECISIONS list and a CONTEXT list, and must never
+#                   promote a CONTEXT item into something "waiting on you". A
+#                   model that invents an obligation here makes the whole tool
+#                   untrustworthy. Test any candidate on exactly that.
+#                   Runs unattended, so latency barely matters — pick on
+#                   instruction-following, not speed.
+#
+#   reducer_model   The escalation path: when a payload is too big for the
+#                   worker, this reads it in chunks and extracts what matters.
+#                   Also unattended. Wants a long context window.
+#
+#   chat_model      `mj ask` and `mj chat`. You are sitting there waiting, so
+#                   CONSISTENCY BEATS PEAK QUALITY — a model with a 0.7s median
+#                   and a 30s tail feels worse than a steady 2.5s one. Wants to
+#                   hold a thread across many turns and to disagree with you.
+#
+#   agent_model     `mj do` and `/agent`. Must support tool calling. Wants to
+#                   write correct code and follow a multi-step plan; its latency
+#                   compounds because one task is many turns. Leave empty to
+#                   reuse chat_model.
+#
+#   fallback_model  Tried once, for any role, when that role's model fails in a
+#                   way a retry cannot fix. Put it on a DIFFERENT provider from
+#                   your primaries — the point is surviving one provider having
+#                   a bad day. Set to "" to disable.
+#
+brain:
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+
+  worker_model: dots-studio/dots-3-note-preview:free
+  fuser_model: nvidia/nemotron-3-ultra-550b-a55b:free
+  reducer_model: nvidia/nemotron-3-super-120b-a12b:free
+  chat_model: dots-studio/dots-3-note-preview:free
+  agent_model: poolside/laguna-s-2.1:free
+  fallback_model: nvidia/nemotron-3-ultra-550b-a55b:free
+
+  # Fold the oldest turns of a conversation into a summary past this size,
+  # keeping recent ones verbatim. Lower it to see compaction happen.
+  chat_compact_threshold_tokens: 32000
+
+  timeout: 120.0
+  # Low on purpose. Every role here reports facts; none of them is writing
+  # prose you want surprised by.
+  temperature: 0.3
+
+# --- OTHER PROVIDERS -------------------------------------------------------
+#
+# Anything speaking the OpenAI /chat/completions shape works. Replace the three
+# lines above with one of these.
+#
+# Ollama, entirely local — no key, no network, no per-token cost. Slower on a
+# CPU-only machine, and a small model will struggle with the fuser's rules.
+#   brain:
+#     provider: ollama
+#     base_url: http://localhost:11434/v1
+#     api_key_env: OLLAMA_API_KEY      # unused; Ollama ignores auth
+#     worker_model: llama3.2
+#     fuser_model: qwen2.5:14b
+#     reducer_model: qwen2.5:14b
+#     chat_model: qwen2.5:14b
+#     agent_model: qwen2.5-coder:14b
+#     fallback_model: ""               # nothing to fall back to
+#
+# LM Studio, also local:
+#   base_url: http://localhost:1234/v1
+#
+# OpenAI directly:
+#   brain:
+#     provider: openai
+#     base_url: https://api.openai.com/v1
+#     api_key_env: OPENAI_API_KEY
+#     chat_model: gpt-4o-mini
+#
+# Groq, Together, Fireworks, vLLM and most hosted providers work the same way —
+# swap base_url and api_key_env.
+#
+# CLAUDE: Anthropic's own API is not OpenAI-shaped, so pointing base_url at it
+# will not work. Reach Claude models through OpenRouter instead:
+#   brain:
+#     provider: openrouter
+#     base_url: https://openrouter.ai/api/v1
+#     api_key_env: OPENROUTER_API_KEY
+#     chat_model: anthropic/claude-sonnet-4.5
+# (Any provider offering an OpenAI-compatible endpoint can be used directly;
+# check its docs for one before assuming its native API will do.)
+
+# ---------------------------------------------------------------------------
+# voice — speaking and listening
+# ---------------------------------------------------------------------------
+#
+# Optional in both directions. Set enabled: false and Majordomo prints instead
+# of speaking, and `/voice` disappears from the chat prompt.
+#
+# Needs extras:  pip install -e .[nvidia]   speech out, and in
+#                pip install -e .[voice]    microphone capture
+voice:
+  enabled: true
+  provider: nvidia
+  api_key_env: NVIDIA_API_KEY
+  voice_id: Magpie-Multilingual.EN-US.Sofia
+
+  # NVCF function ids. These are PER MODEL and the ASR one is a different
+  # function from the TTS one — find them on the model's page at
+  # build.nvidia.com. Guessing gets you DEADLINE_EXCEEDED or INVALID_ARGUMENT.
+  function_id: 877104f7-e885-42b9-8de8-f6e4c6303969   # TTS
+  asr_function_id: ""                                  # ASR — yours to fill in
+
+  language: en-US
+  sample_rate: 44100
+  asr_sample_rate: 16000
+
+  # Don't repeat a briefing you already heard within this many minutes.
+  repeat_after_minutes: 120
+
+  # The key that starts listening at the chat prompt, as a raw control
+  # character. Default is Ctrl+N (\x0e).
+  #
+  # NOT Ctrl+M: that is byte 13, exactly what Enter sends. A terminal cannot
+  # tell them apart, so binding it would make Enter start recording.
+  # listen_key: "\x0e"
+
+  # --- tuning the microphone ---
+  #
+  # Run `mj mic` and talk for the whole measurement. It reports where your
+  # speech and your pauses actually sit, and tells you whether these are right.
+  #
+  # How long a pause means "I have finished" rather than "I am thinking".
+  # 0 calibrates automatically. Raise it if you pause mid-sentence around
+  # fillers; the default was once 900ms and cut people off constantly.
+  trailing_silence_ms: 0
+  # How loud a chunk must be to count as speech. 0 measures the room for half a
+  # second and derives it, which is almost always better than a fixed number —
+  # a threshold above your speaking level stops recording mid-word, and one
+  # below your room tone never stops at all. Set it only if `mj mic` says to.
+  silence_rms: 0
+
+  listen_max_seconds: 30.0
+
+# ---------------------------------------------------------------------------
+# sources — where the briefing gets its facts
+# ---------------------------------------------------------------------------
+sources:
+  github:
+    enabled: true
+    # A classic PAT with `repo` scope. Named here, set in ~/.majordomo/.env.
+    token_env: MAJORDOMO_GH_TOKEN
+    api_base: https://api.github.com     # change for GitHub Enterprise
+    # How far back `mj activity` looks by default.
+    activity_days: 90
+    # Paging for the activity cache. GitHub's search API refuses to return more
+    # than 1000 results, so at 100 per page, 10 is the real ceiling however high
+    # you set this — past that, narrow the window instead.
+    activity_per_page: 100
+    activity_max_pages: 5
+
+  gmail:
+    # Off by default: it needs an app password, and most people want the
+    # development context first.
+    enabled: false
+    address_env: GMAIL_ADDRESS
+    password_env: GMAIL_APP_PASSWORD
+    query: "is:unread in:inbox category:primary newer_than:1d"
+    max_messages: 20
+
+  sessions:
+    # Live Claude Code sessions. Needs `mj install-hooks` once.
+    enabled: true
+    # Idle longer than this and a session is treated as ended, not waiting.
+    active_timeout_minutes: 90
+    stale_after_hours: 72
+
+# ---------------------------------------------------------------------------
+# memory — the facts about you that get sent with every question
+# ---------------------------------------------------------------------------
+memory:
+  enabled: true
+  # How many memory *bodies* travel with a request. The one-line index always
+  # goes; this caps the full text, which is what costs tokens.
+  max_bodies_loaded: 8
+
+# ---------------------------------------------------------------------------
+# the rest
+# ---------------------------------------------------------------------------
+scaffold:
+  # Where `mj start` creates new projects.
+  root: ~/projects
+
+router:
+  # A source's payload above this size goes to the reducer instead of straight
+  # to the fuser. Drop it to something small to watch that path fire:
+  #   mj brief --no-speak --explain      # routing should read `escalated`
+  size_threshold_tokens: 50000

@@ -1,6 +1,8 @@
 """Tests for majordomo.config — no file I/O beyond tmp_path, no network."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from majordomo import config as config_module
@@ -144,3 +146,48 @@ def test_repeat_after_minutes_is_configurable(tmp_path):
     path = tmp_path / "config.yml"
     path.write_text("voice:\n  repeat_after_minutes: 15\n", encoding="utf-8")
     assert config_module.load(str(path)).voice.repeat_after_minutes == 15
+
+
+# ---------------------------------------------------------------------------
+# The shipped example
+# ---------------------------------------------------------------------------
+
+
+EXAMPLE = Path(config_module.__file__).resolve().parent / "config.example.yml"
+
+
+def test_the_example_config_exists_where_the_cli_looks_for_it():
+    """Beside the module, not at the repo root — a wheel install has no repo
+    root, and `mj config --init` has to work for someone who ran pip install."""
+    assert EXAMPLE.is_file()
+
+
+def test_the_example_loads_and_agrees_with_the_defaults():
+    """A stale example is worse than none: it teaches keys that do nothing."""
+    from_example = config_module.load(str(EXAMPLE))
+    from_defaults = config_module.build(config_module.DEFAULTS)
+
+    assert from_example.brain == from_defaults.brain
+    assert from_example.router == from_defaults.router
+    assert from_example.memory == from_defaults.memory
+    assert from_example.scaffold == from_defaults.scaffold
+
+
+def test_the_example_documents_every_brain_role():
+    """The roles are the thing someone cloning this has to choose between, and
+    they are invisible without an explanation of what each is optimising for."""
+    text = EXAMPLE.read_text(encoding="utf-8")
+
+    for role in ("worker_model", "fuser_model", "reducer_model",
+                 "chat_model", "agent_model", "fallback_model"):
+        assert role in text, f"{role} is not in the example"
+
+
+def test_the_example_names_no_secrets():
+    """It names environment *variables*, never values, so it stays safe to
+    commit and safe to paste into an issue."""
+    text = EXAMPLE.read_text(encoding="utf-8")
+
+    assert "sk-" not in text
+    assert "ghp_" not in text
+    assert "API_KEY:" not in text        # a key named as a value, not an env var

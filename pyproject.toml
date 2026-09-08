@@ -35,9 +35,23 @@ mj = "majordomo.cli:main"
 # NVIDIA Riva speaks gRPC rather than HTTP, so it is an extra — a text-only
 # install has no business pulling in grpc.
 nvidia = ["nvidia-riva-client>=2.14"]
+# Speech *in*. Output needed nothing — winsound is stdlib — but there is no
+# stdlib way to capture from a microphone, so this is the one new dependency
+# voice costs. Riva handles the transcription itself via the nvidia extra.
+voice = ["sounddevice>=0.4"]
 tray = ["pystray>=0.19", "Pillow>=10.0"]
 dev = ["pytest>=8.0"]
+
+# The annotated example config ships with the package: `mj config --init`
+# has to work for a wheel install, which has no repo root to read from.
+[tool.setuptools.package-data]
+majordomo = ["config.example.yml"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["majordomo*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "network: this test genuinely needs the network (nothing does today)",
+]
