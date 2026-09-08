@@ -17,13 +17,13 @@ editing session.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, get_args
 
 from majordomo.models import SessionEvent, SessionStatus, Surface
+from majordomo import jsonlog
 from majordomo.paths import state_path
 
 _VALID_STATUSES = frozenset(get_args(SessionStatus))
@@ -130,7 +130,8 @@ def append_event(event: SessionEvent, path: Path | str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 #: Compact once the log passes this. Roughly 10k events — months of use.
-COMPACT_OVER_BYTES = 2_000_000
+#: Re-exported from ``jsonlog`` so callers of this module keep working.
+COMPACT_OVER_BYTES = jsonlog.COMPACT_OVER_BYTES
 
 
 def compact(
@@ -189,15 +190,11 @@ def compact(
     if dropped <= 0:
         return 0
 
-    # Write beside the target then replace: os.replace is atomic, so a reader
+    # Atomic, via jsonlog: a reader sees the whole old log or the whole new
     # sees either the old file or the new one, never a half-written log. A hook
     # appending inside the swap window could lose one event — acceptable against
     # unbounded growth, and it is why this never runs from the hook itself.
-    temp = target.with_suffix(".jsonl.compacting")
-    with open(temp, "w", encoding="utf-8") as fh:
-        for event in kept:
-            fh.write(json.dumps(event.to_json(), ensure_ascii=False) + "\n")
-    os.replace(temp, target)
+    jsonlog.rewrite(target, kept)
 
     return dropped
 
@@ -210,7 +207,7 @@ def maybe_compact(
     """Compact only if the log has actually got big. Never raises."""
     target = Path(path) if path is not None else state_path()
     try:
-        if not target.is_file() or target.stat().st_size <= max_bytes:
+        if not jsonlog.is_large(target, max_bytes):
             return 0
         return compact(target, keep_hours=keep_hours)
     except OSError:
