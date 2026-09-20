@@ -17,15 +17,6 @@ mj do "add tests for X"      # the agent works in this directory, asking before 
 mj brief                     # one spoken summary of what actually needs you
 ```
 
-Status: **in development**, used daily by its author. Windows first; nothing is
-deliberately platform-locked but nothing else is tested.
-
-## Install
-
-```
-pip install -e .[dev]
-```
-
 Python 3.10+. Configuration is entirely optional — every setting has a default:
 
 ```
