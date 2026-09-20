@@ -151,20 +151,23 @@ Each has an `uninstall-` counterpart.
 
 ## How it is put together
 
-Two different shapes, and the difference matters.
-
-**The briefing is a fixed pipeline.** Workers fetch from each source, a router decides
-whether a payload is small enough to pass through or needs reducing first, and a fuser
-writes the single summary. The code chooses every step; models only produce text. If a
-source fails, the briefing degrades to a plain list rather than failing.
+Two different shapes, and the difference is the most interesting thing here.
 
 **The agent is a loop.** It picks the next action from a tool set and keeps going until it
-is done or hits a turn cap. This is the only place a model decides what happens next, which
-is why it is the only place with a confirmation gate.
+is done or hits a turn cap. This is the only place a model decides what happens next — and
+therefore the only place with a confirmation gate. Reads run freely, writes and commands
+are shown and confirmed, paths are confined, credentials are refused outright.
 
-Conversations compact when they grow past a threshold: older turns fold into running notes,
-recent ones stay verbatim, and the notes are carried forward rather than re-summarised each
-round.
+**The briefing is a fixed pipeline.** Workers fetch from each source, a router decides
+whether a payload needs reducing first, and a fuser writes the single summary. The code
+chooses every step; models only produce text. If a source fails it degrades to a plain
+list rather than failing.
+
+**A conversation is a model, and the terminal is one consumer of it.**
+[`session.py`](majordomo/session.py) owns turns, compaction and the file on disk;
+[`chat.py`](majordomo/chat.py) owns the loop, the prompt and the keys. They were one
+module, and every bug at the seam was the two disagreeing about the same conversation —
+what was stored differing from what you were shown.
 
 ## Development
 
@@ -172,7 +175,7 @@ round.
 pytest
 ```
 
-782 tests. The suite covers the safety properties directly — path confinement, the
+976 tests. The suite covers the safety properties directly — path confinement, the
 confirmation gate, what compaction keeps — because those are the parts where being wrong
 is expensive rather than merely annoying.
 

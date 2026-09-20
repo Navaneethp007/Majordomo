@@ -47,10 +47,21 @@ def safe_print(text: str = "", file=None) -> None:
     if stream is None:  # pythonw.exe: no console at all
         return
     try:
-        print(text, file=stream)
+        # Flushed, because the other half of this program's output goes to
+        # stderr, which is not buffered. Without it, a redirected run showed the
+        # "stopped:" line *before* the work it stopped after — the failure
+        # arriving ahead of the result it was reporting on.
+        print(text, file=stream, flush=True)
     except UnicodeEncodeError:
         encoding = getattr(stream, "encoding", None) or "ascii"
         stream.write(text.encode(encoding, errors="replace").decode(encoding) + "\n")
+        # Flushed here too. This branch exists *for* emoji-bearing lines, so
+        # without it the stderr-arrives-first ordering bug survived in exactly
+        # the case the flush above was added to fix.
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
     except (OSError, ValueError):
         # A closed or detached stream. The briefing is not worth a crash.
         pass
@@ -259,9 +270,47 @@ def cmd_chat(args) -> None:
             sys.exit(1)
 
     try:
-        chat_mod.run(config, resume=bool(args.resume), transcript=transcript)
+        chat_mod.run(
+            config,
+            resume=bool(args.resume),
+            transcript=transcript,
+            terminal=terminal(),
+        )
     except KeyboardInterrupt:  # pragma: no cover - the loop catches its own
         safe_print("")
+
+
+def ask(question: str) -> str:
+    """Put a question to whoever is at the keyboard. "" when nobody is.
+
+    The counterpart to ``safe_print``: the one place a library module's request
+    for an answer becomes an actual read of stdin.
+
+    ``EOFError`` is "" — nobody is there, which every caller treats as a
+    refusal. **Ctrl+C propagates**, because it is not an answer. Swallowing it
+    here collapsed "declined" and "interrupted" into one value, and a loop over
+    memory candidates then declined the first and cheerfully asked about the
+    second. What an interrupt should abort differs by caller, so the callers
+    decide.
+    """
+    try:
+        return input(question)
+    except EOFError:
+        safe_print("")
+        return ""
+
+
+def terminal():
+    """The real console, wired into ``chat``'s three callables.
+
+    `chat` used to import ``safe_print`` and ``confirm_action`` from here, which
+    pointed the dependency the wrong way round — the conversation depending on
+    the command line rather than the other way about. Handing it these three
+    instead leaves `chat` importable without a console at all.
+    """
+    from majordomo.chat import Terminal
+
+    return Terminal(write=safe_print, ask=ask, confirm=confirm_action)
 
 
 def confirm_action(name: str, arguments: dict) -> bool:
@@ -398,27 +447,21 @@ def cmd_do(args) -> None:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if outcome.answer:
-        from majordomo import render as render_mod
+    # One rendering, shared with `/agent` — two of them drift, and the last
+    # time they did the transcript recorded a stop message while the screen
+    # showed the work that had actually succeeded.
+    from majordomo import chat as chat_mod
+    from majordomo import render as render_mod
 
-        safe_print("")
-        safe_print(render_mod.render(outcome.answer))
-    elif not outcome.stopped_because:
-        # A model can end its turn with no text and no tool call. Without this
-        # the command printed nothing whatsoever and exited 0 — no answer, no
-        # error, no way to tell it from a task that needed no output.
-        # `chat.send` has guarded this with "(empty response)" all along.
-        print(
-            "warning: the agent finished without saying anything"
-            + (
-                f" (it did run {len(outcome.steps)} step(s) — check the files)"
-                if outcome.steps
-                else ""
-            ),
-            file=sys.stderr,
-        )
+    report = chat_mod.agent_report(outcome)
+    safe_print("")
+    safe_print(render_mod.render(report))
 
-    if outcome.stopped_because:
+    # On stderr as well, because the exit status is 0 either way and that is
+    # how a script notices — but only when the report has not already said
+    # it. With nothing to salvage the report *is* the stop message, and
+    # printing it twice reads as two separate problems.
+    if outcome.stopped_because and outcome.stopped_because not in report:
         print(f"\nstopped: {outcome.stopped_because}", file=sys.stderr)
 
     declined = [s for s in outcome.steps if not s.approved]
@@ -588,6 +631,41 @@ def cmd_start(args) -> None:
 # mj ask
 # ---------------------------------------------------------------------------
 
+def _shell_quote(text: str) -> str:
+    """Quote a task so the printed command survives being pasted.
+
+    Interpolating into double quotes broke on any task containing one:
+
+        mj do "find the "TODO" markers"     <- three arguments, not one
+
+    Double quotes with the inner ones escaped, always. The previous version
+    reached for single quotes when the text held a double, which is correct in
+    bash and PowerShell and **wrong in cmd.exe** — cmd has no single-quote
+    syntax and passes them through as literal characters, so the command it
+    printed could not be pasted into the shell this project is mostly used from.
+
+    `\\"` is not cmd.exe's own escape either; cmd cannot represent an embedded
+    double quote in a way the other two also accept. Rather than pick a form
+    that is wrong somewhere and claim otherwise, this picks the one that works
+    in two of three and `describe_quoting` says so out loud.
+    """
+    return '"' + text.replace('"', '\\"') + '"'
+
+
+def describe_quoting(text: str) -> str:
+    """A warning when the printed command will not paste everywhere, else "".
+
+    Said only when it applies. A caveat attached to every command would be
+    ignored by the time it mattered.
+    """
+    if '"' not in text:
+        return ""
+    return (
+        "(the quotes are escaped for bash and PowerShell; cmd.exe cannot "
+        "represent an embedded quote — retype it there)"
+    )
+
+
 def cmd_ask(args) -> None:
     """One question, one answer, no conversation state."""
     from majordomo import activity as activity_mod
@@ -626,6 +704,43 @@ def cmd_ask(args) -> None:
     from majordomo import render as render_mod
 
     answer = (reply or "").strip() or "(empty response)"
+
+    # One-shot, so there is nobody to ask — print the command instead of an
+    # offer. Anything `/agent` would say here is wrong: there is no chat to stay
+    # in, and two different instructions in one output is worse than none.
+    # The same shape as `chat._offer_agent`, deliberately. These two have
+    # disagreed twice: first about whether a leaked tool call keeps its prose,
+    # then about whether the marker branch does. Both times the branch that was
+    # already right stayed right and the sibling stayed wrong, because there was
+    # nothing making them one algorithm.
+    task = prompts.needs_agent(answer)
+    leaked = task is None and prompts.looks_like_a_tool_call(answer)
+
+    if task is not None or leaked:
+        # Whichever marker it is, keep what was written before it. A model that
+        # wrote a useful paragraph and then asked for the agent should lose the
+        # marker, not the paragraph.
+        kept = (
+            prompts.strip_tool_call(answer) if leaked
+            else prompts.strip_needs_agent(answer)
+        )
+        if kept:
+            safe_print(render_mod.render(kept))
+            safe_print("")
+        if leaked:
+            safe_print(prompts.NO_TOOLS_HERE)
+            safe_print("")
+
+        # `not task` means the marker carried nothing; the question is the best
+        # available description of the job.
+        task = task or question
+        safe_print("That needs the agent, which can read and change files:")
+        safe_print(f"  mj do {_shell_quote(task)}")
+        caveat = describe_quoting(task)
+        if caveat:
+            safe_print(f"  {caveat}")
+        return
+
     safe_print(render_mod.render(answer))
 
 
@@ -850,7 +965,7 @@ def cmd_install_trigger(args) -> None:
     from majordomo import trigger
 
     try:
-        registered = trigger.install()
+        registered, warnings = trigger.install()
     except trigger.TriggerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -858,6 +973,8 @@ def cmd_install_trigger(args) -> None:
     print("Registered scheduled tasks:")
     for name in registered:
         print(f"  + {name}")
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
 
 
 def cmd_uninstall_trigger(args) -> None:

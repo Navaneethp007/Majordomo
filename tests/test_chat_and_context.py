@@ -7,6 +7,7 @@ directly rather than left to review.
 """
 from __future__ import annotations
 
+import io
 import time
 from datetime import datetime, timezone
 from unittest import mock
@@ -14,6 +15,7 @@ from unittest import mock
 import pytest
 
 from majordomo import activity, chat, context, memory, prompts, scaffold
+from majordomo import session as session_mod
 from majordomo import config as config_module
 from majordomo.paths import chats_dir
 
@@ -543,7 +545,7 @@ def test_the_current_exchange_is_never_folded_away():
                chat.Turn("user", "the actual question")],
     )
 
-    assert chat._recent_to_keep(session, config) >= chat.MIN_RECENT_TURNS
+    assert session_mod._recent_to_keep(session, config) >= chat.MIN_RECENT_TURNS
 
     with mock.patch("majordomo.llm.complete", return_value="notes"):
         chat.compact(session, config)
@@ -698,9 +700,24 @@ def test_resuming_restores_both_the_context_and_the_record(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def handle(line, session, config=CFG):
+def fake_terminal(said=None, answer=""):
+    """A console that records what was written and gives one canned answer.
+
+    Replaces `mock.patch("builtins.input")` throughout. That the prompt is now
+    an injected callable rather than a global is the whole point of `Terminal`:
+    the test says what it wants instead of reaching into the interpreter.
+    """
+    said = [] if said is None else said
+    return chat.Terminal(
+        write=said.append,
+        ask=lambda _question: answer,
+        confirm=lambda _name, _arguments: answer.lower() in ("y", "yes"),
+    )
+
+
+def handle(line, session, config=CFG, answer=""):
     written = []
-    ended = chat._handle_command(line, session, config, written.append)
+    ended = chat._handle_command(line, session, config, fake_terminal(written, answer))
     return ended, "\n".join(written)
 
 
@@ -756,7 +773,7 @@ def test_quitting_without_typing_writes_no_transcript(tmp_path, monkeypatch):
     """An empty transcript still sorts newest by mtime, so opening the REPL and
     quitting made *that* the latest session — and --resume then restored nothing
     over yesterday's conversation."""
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     yesterday = tmp_path / "20260901-120000.jsonl"
     yesterday.write_text('{"role": "user", "content": "real work", "at": ""}\n', encoding="utf-8")
 
@@ -770,7 +787,7 @@ def test_quitting_without_typing_writes_no_transcript(tmp_path, monkeypatch):
 
 
 def test_a_conversation_is_still_saved_on_exit(tmp_path, monkeypatch):
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
     session.log = [chat.Turn("user", "something real")]
 
@@ -785,7 +802,7 @@ def test_a_conversation_is_still_saved_on_exit(tmp_path, monkeypatch):
 def test_a_compacted_conversation_is_still_saved(tmp_path, monkeypatch):
     """Guarding on `turns` rather than `log` would skip saving a long
     conversation that had just been folded down."""
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
     session.log = [chat.Turn("user", "hours of work")]
     session.turns = []                       # as if compaction emptied it
@@ -802,7 +819,7 @@ def test_resume_skips_an_empty_transcript(tmp_path, monkeypatch):
     """`run` no longer writes empty ones, but any already on disk would still
     sort newest and shadow real work — and resuming nothing is worse than
     reaching one file further back."""
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     real = tmp_path / "20260901-120000.jsonl"
     real.write_text('{"role": "user", "content": "real", "at": ""}\n', encoding="utf-8")
     (tmp_path / "20260902-120000.jsonl").write_text("", encoding="utf-8")
@@ -811,7 +828,7 @@ def test_resume_skips_an_empty_transcript(tmp_path, monkeypatch):
 
 
 def test_an_empty_transcript_is_ignored_not_deleted(tmp_path, monkeypatch):
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     (tmp_path / "20260901-120000.jsonl").write_text("x", encoding="utf-8")
     empty = tmp_path / "20260902-120000.jsonl"
     empty.write_text("", encoding="utf-8")
@@ -823,7 +840,7 @@ def test_an_empty_transcript_is_ignored_not_deleted(tmp_path, monkeypatch):
 
 
 def test_no_transcripts_at_all_resumes_nothing(tmp_path, monkeypatch):
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     assert chat.latest_transcript() is None
 
 
@@ -888,7 +905,7 @@ def test_resuming_a_long_conversation_compacts_before_the_first_message(tmp_path
     """The file is the record and is never compacted, so a resumed chat arrives
     at full length. Folding it on the first message means re-sending the whole
     history once, at full price, before deciding it was too long."""
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     path = tmp_path / "c.jsonl"
     big = chat.Session(system="SYS", path=path)
     big.log = [sized("user", 400), sized("assistant", 400)] * 6
@@ -904,7 +921,7 @@ def test_resuming_a_long_conversation_compacts_before_the_first_message(tmp_path
 
 
 def test_resuming_a_short_conversation_does_not_compact(tmp_path, monkeypatch):
-    monkeypatch.setattr(chat, "chats_dir", lambda: tmp_path)
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     path = tmp_path / "c.jsonl"
     small = chat.Session(system="SYS", path=path)
     small.log = [chat.Turn("user", "hi"), chat.Turn("assistant", "hello")]
@@ -915,3 +932,603 @@ def test_resuming_a_short_conversation_does_not_compact(tmp_path, monkeypatch):
 
     called.assert_not_called()
     assert len(resumed.turns) == 2
+
+
+# ---------------------------------------------------------------------------
+# Handing a request to the agent
+# ---------------------------------------------------------------------------
+
+
+def test_the_marker_is_parsed_structurally():
+    """The same discipline as `needs_you`: decided in Python from a marker the
+    model was told to emit, never inferred from how a sentence reads."""
+    assert prompts.needs_agent("NEEDS_AGENT: review the raad-whatsapp folder") == (
+        "review the raad-whatsapp folder"
+    )
+    assert prompts.needs_agent("  NEEDS_AGENT:  trim it  ") == "trim it"
+    assert prompts.needs_agent("Sure, here is the answer.") is None
+
+
+def test_the_task_may_sit_on_the_next_line():
+    """`NEEDS_AGENT:\n<task>` returned None, and a None means no offer fires and
+    the raw reply prints — putting the protocol token on screen, which is the
+    one outcome it exists to prevent."""
+    assert prompts.needs_agent("NEEDS_AGENT:\nreview the api folder") == (
+        "review the api folder"
+    )
+    assert prompts.needs_agent("NEEDS_AGENT:\n\n  look inside  ") == "look inside"
+    assert prompts.needs_agent("NEEDS_AGENT:\n```\nread it\n```") == "read it"
+
+
+def test_a_bare_marker_is_still_a_hand_off():
+    """Empty, not None: the caller falls back to what was asked for. None would
+    print the marker."""
+    assert prompts.needs_agent("NEEDS_AGENT:") == ""
+
+
+def test_an_ordinary_answer_costs_one_membership_test():
+    assert prompts.needs_agent("a long ordinary reply\nover several lines") is None
+
+
+@pytest.mark.parametrize(
+    "leaked",
+    [
+        "<dots_function_call>\ninvoke name bash",
+        '<tool_call>{"name": "ls"}</tool_call>',
+        "<function=read_file>{}</function>",
+        '{"tool_calls": [{"function": {"name": "ls"}}]}',
+    ],
+)
+def test_leaked_tool_call_markup_is_recognised(leaked):
+    """Observed with dots-3, which wrote out a <dots_function_call> block
+    complete with a shell command when asked to look inside a folder. Raw XML in
+    the terminal reads as though something ran. Nothing did."""
+    assert prompts.looks_like_a_tool_call(leaked)
+
+
+@pytest.mark.parametrize(
+    "ordinary",
+    [
+        "Use `ls -la` to list the files.",
+        "The function call syntax varies by provider.",
+        "I would call the function `add(a, b)` here.",
+    ],
+)
+def test_ordinary_prose_about_functions_is_not_mistaken_for_one(ordinary):
+    assert not prompts.looks_like_a_tool_call(ordinary)
+
+
+def offer(reply, asked="look at that folder", answer="n", seeded=False):
+    said = []
+    session = chat.Session(system="SYS")
+    if seeded:
+        # As `send` leaves it: the raw reply already appended, which is what
+        # `_restate_last_answer` exists to correct.
+        session.turns = [chat.Turn("assistant", reply)]
+        session.log = list(session.turns)
+    took_over = chat._offer_agent(
+        session, CFG, reply, asked, fake_terminal(said, answer)
+    )
+    return took_over, "\n".join(said), session
+
+
+def test_an_ordinary_reply_is_left_alone():
+    took_over, said, _ = offer("Coffee is a matter of taste.")
+    assert took_over is False
+    assert said == ""
+
+
+def test_the_marker_produces_an_offer():
+    took_over, said, _ = offer("NEEDS_AGENT: review the raad-whatsapp folder")
+
+    assert took_over is True                       # chat does not print the marker
+    assert "needs the agent" in said
+    assert "review the raad-whatsapp folder" in said
+
+
+def test_declining_runs_nothing_and_says_how():
+    with mock.patch("majordomo.chat.run_agent") as ran:
+        took_over, said, _ = offer("NEEDS_AGENT: delete everything", answer="n")
+
+    ran.assert_not_called()
+    assert took_over is True
+    assert "/agent" in said
+
+
+def test_accepting_runs_exactly_what_agent_would():
+    """The offer exists to *be* the command, so it must not be a second path."""
+    with mock.patch("majordomo.chat.run_agent") as ran:
+        offer("NEEDS_AGENT: add a docstring to render.py", answer="y")
+
+    assert ran.call_args[0][2] == "add a docstring to render.py"
+
+
+def test_leaked_markup_is_replaced_not_printed():
+    took_over, said, _ = offer("<dots_function_call>\ninvoke name bash\nls -la")
+
+    assert took_over is True
+    assert "dots_function_call" not in said        # never reaches the terminal
+    assert "cannot read files" in said
+
+
+def test_leaked_markup_falls_back_to_what_you_asked_for():
+    """There is no marker to read a task from, so the user's own sentence is
+    the best available description of the job."""
+    with mock.patch("majordomo.chat.run_agent") as ran:
+        offer("<tool_call>ls</tool_call>", asked="check the config folder", answer="y")
+
+    assert ran.call_args[0][2] == "check the config folder"
+
+
+def test_a_refused_prompt_declines_rather_than_running():
+    """No answer at all — a closed stdin, a Ctrl+C — is a refusal."""
+    session = chat.Session(system="SYS")
+    with mock.patch("majordomo.chat.run_agent") as ran:
+        chat._offer_agent(
+            session, CFG, "NEEDS_AGENT: x", "x", chat.HEADLESS
+        )
+
+    ran.assert_not_called()
+
+
+def test_agent_and_the_offer_share_one_runner():
+    """Two copies would eventually stop agreeing about what the command does."""
+    import inspect
+
+    source = inspect.getsource(chat._handle_command)
+    assert "run_agent(session, config, argument, terminal)" in source
+
+
+# ---------------------------------------------------------------------------
+# The detector must not eat correct answers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "discussion",
+    [
+        'OpenAI returns a "tool_calls" array in the message object.',
+        'The Anthropic API uses <invoke name="get_weather"> in its examples.',
+        "You parse tool_calls from choices[0].message.",
+        "A <tool_call> block is what providers emit.",
+        "The <function=name> syntax varies between providers.",
+        "Majordomo defines its tools in tools.py, then passes them as `tools`.",
+        # Fenced: quoted precisely because it is an illustration. Allowing a
+        # fence *prefix* did nothing — the token still starts its own line
+        # inside the block — so the answer was truncated at the fence.
+        "A tool call looks like this:\n\n```\n<tool_call>\n{}\n```\n\nThat is the shape.",
+        "Example:\n```json\n\"tool_calls\": []}\n```",
+    ],
+)
+def test_talking_about_tool_calls_is_not_emitting_one(discussion):
+    """A substring net over the reply flagged correct answers — and this project
+    is itself an LLM tool, so "how do tool calls work?" is a question actually
+    worth asking. An emitted call opens its own line; a mention sits inside a
+    sentence."""
+    assert not prompts.looks_like_a_tool_call(discussion)
+
+
+@pytest.mark.parametrize(
+    "emitted",
+    [
+        "<dots_function_call>\ninvoke name bash",
+        '<tool_call>{"name": "ls"}</tool_call>',
+        "<function=read_file>{}</function>",
+        '{"tool_calls": [{"function": {"name": "ls"}}]}',
+        "Here is what I found.\n\n<tool_call>ls -la</tool_call>",
+    ],
+)
+def test_an_emitted_call_is_still_caught(emitted):
+    assert prompts.looks_like_a_tool_call(emitted)
+
+
+def test_stripping_keeps_the_prose_around_the_block():
+    """A model that wrote three good paragraphs and one stray block should lose
+    the block, not the paragraphs."""
+    reply = "First point.\n\nSecond point.\n\n<tool_call>{\"name\": \"ls\"}</tool_call>"
+
+    kept = prompts.strip_tool_call(reply)
+
+    assert "First point." in kept and "Second point." in kept
+    assert "tool_call" not in kept
+
+
+def test_stripping_an_ordinary_reply_changes_nothing():
+    assert prompts.strip_tool_call("Just an answer.") == "Just an answer."
+
+
+# ---------------------------------------------------------------------------
+# What is stored is what you were shown
+# ---------------------------------------------------------------------------
+
+
+def stored_after(reply, answer="n"):
+    session = chat.Session(system="SYS")
+    session.turns = [chat.Turn("user", "look at that folder"),
+                     chat.Turn("assistant", reply)]
+    session.log = list(session.turns)
+    with mock.patch("majordomo.chat.run_agent"):
+        chat._offer_agent(
+            session, CFG, reply, "look at that folder", fake_terminal(answer=answer)
+        )
+    return session
+
+
+def test_a_bare_marker_is_not_left_in_the_conversation():
+    """`send` stores the reply the moment it arrives, so suppressing it on
+    screen alone left the marker replayed to the model next turn, restored by
+    --resume, and handed to the memory proposer at exit."""
+    session = stored_after("NEEDS_AGENT: review the raad-whatsapp folder")
+
+    assert prompts.NEEDS_AGENT_MARKER not in session.turns[-1].content
+    assert prompts.NEEDS_AGENT_MARKER not in session.log[-1].content
+    assert "needs the agent" in session.turns[-1].content
+
+
+def test_leaked_markup_is_not_left_in_the_conversation():
+    session = stored_after("Some prose.\n\n<tool_call>ls</tool_call>")
+
+    assert "tool_call" not in session.turns[-1].content
+    assert "tool_call" not in session.log[-1].content
+    assert "Some prose." in session.turns[-1].content      # the answer survives
+
+
+def test_the_context_and_the_record_agree():
+    session = stored_after("NEEDS_AGENT: do a thing")
+    assert session.turns[-1].content == session.log[-1].content
+
+
+def test_declining_still_leaves_you_the_answer():
+    """Decline the offer and the prose that came with the block must remain."""
+    said = []
+    session = chat.Session(system="SYS")
+    session.turns = [chat.Turn("assistant", "x")]
+    session.log = list(session.turns)
+
+    chat._offer_agent(
+        session, CFG,
+        "Three good paragraphs.\n\n<tool_call>ls</tool_call>",
+        "look", fake_terminal(said, "n"),
+    )
+
+    assert "Three good paragraphs." in "\n".join(said)
+
+
+# ---------------------------------------------------------------------------
+# The wait
+# ---------------------------------------------------------------------------
+
+
+class FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_nothing_is_printed_when_output_is_not_a_terminal():
+    """Redirected, a session would fill with timer frames."""
+    plain = io.StringIO()
+
+    with chat.Waiting(stream=plain):
+        time.sleep(chat.Waiting.INTERVAL * 3)
+
+    assert plain.getvalue() == ""
+
+
+def test_the_timer_shows_seconds_not_just_activity():
+    """Latency here ranges 2–31s on the same prompt. A spinner looks identical
+    at both; the number is what tells you it is stuck."""
+    tty = FakeTTY()
+
+    with mock.patch("majordomo.render.supports_ansi", return_value=True):
+        with chat.Waiting(stream=tty):
+            time.sleep(chat.Waiting.INTERVAL * 3)
+
+    frames = tty.getvalue()
+    assert "thinking" in frames
+    assert "s" in frames
+
+
+def test_the_line_is_cleared_when_the_reply_lands():
+    """Residue on the prompt line is worse than no timer at all."""
+    tty = FakeTTY()
+
+    with mock.patch("majordomo.render.supports_ansi", return_value=True):
+        with chat.Waiting(stream=tty):
+            time.sleep(chat.Waiting.INTERVAL * 2)
+
+    last = tty.getvalue().split("\r")[-1]
+    assert last.strip() == ""
+
+
+def test_a_closed_stream_does_not_take_the_conversation_down():
+    """A progress indicator is never worth that."""
+    tty = FakeTTY()
+    tty.close()
+
+    with mock.patch("majordomo.render.supports_ansi", return_value=True):
+        with chat.Waiting(stream=tty):
+            time.sleep(chat.Waiting.INTERVAL * 2)
+
+
+def test_the_thread_stops_with_the_block():
+    import threading
+
+    before = threading.active_count()
+    with mock.patch("majordomo.render.supports_ansi", return_value=True):
+        with chat.Waiting(stream=FakeTTY()):
+            time.sleep(chat.Waiting.INTERVAL)
+    time.sleep(chat.Waiting.INTERVAL * 2)
+
+    assert threading.active_count() <= before
+
+
+# ---------------------------------------------------------------------------
+# "Remember this"
+# ---------------------------------------------------------------------------
+
+
+def test_the_remember_marker_is_parsed_structurally():
+    """Whether a sentence "sounds like" the user asked to be remembered is not
+    something to branch on."""
+    reply = "Noted.\n\nREMEMBER: He prefers medium-dark roast coffee."
+
+    assert prompts.wants_remembered(reply) == "He prefers medium-dark roast coffee."
+    assert prompts.wants_remembered("just an answer") is None
+
+
+def test_the_marker_line_never_reaches_the_reader():
+    reply = "Noted, dark roast it is.\n\nREMEMBER: He prefers dark roast."
+    assert prompts.strip_remember(reply) == "Noted, dark roast it is."
+
+
+def test_only_chat_is_told_about_the_protocol():
+    """`mj ask` is one-shot — nobody to confirm to, so a marker would print."""
+    assert prompts.REMEMBER_MARKER in prompts.build_chat_system_prompt("")
+    assert prompts.REMEMBER_MARKER not in prompts.build_ask_prompt("", "q")[0]["content"]
+
+
+def remembering(reply, answer="y"):
+    """The two steps `run` takes: strip the marker, then ask about it.
+
+    Separate on purpose — the marker must come out before anything is shown
+    or stored, and the question must come after, or you approve a memory
+    without having seen what produced it.
+    """
+    said = []
+    cleaned, fact = chat._proposed_memory(reply)
+    if fact:
+        chat._save_memory(fact, CFG, fake_terminal(said, answer))
+    return cleaned, "\n".join(said)
+
+
+def test_saying_remember_this_offers_and_writes():
+    """It used to get a friendly "noted" and nothing on disk."""
+    cleaned, said = remembering("Noted.\n\nREMEMBER: He prefers dark roast coffee.")
+
+    assert "dark roast coffee" in said
+    assert [m.description for m in memory.read_all()] == [
+        "He prefers dark roast coffee."
+    ]
+    assert cleaned == "Noted."
+
+
+def test_declining_writes_nothing():
+    remembering("Noted.\n\nREMEMBER: He prefers dark roast.", answer="n")
+    assert memory.read_all() == []
+
+
+def test_the_marker_is_stripped_even_when_declined():
+    """It was never meant to be read, and the caller stores what comes back."""
+    cleaned, _ = remembering("Noted.\n\nREMEMBER: something", answer="n")
+    assert prompts.REMEMBER_MARKER not in cleaned
+
+
+def test_an_ordinary_reply_is_returned_untouched():
+    cleaned, said = remembering("Coffee is a matter of taste.")
+    assert cleaned == "Coffee is a matter of taste."
+    assert said == ""
+
+
+def test_a_refused_memory_says_why_and_does_not_crash():
+    """A credential in the fact is refused by write_memory, and that has to
+    land as a line rather than a traceback in the REPL."""
+    _cleaned, said = remembering("Sure.\n\nREMEMBER: his key is sk-abcdefghijklmnop1234")
+
+    assert "not saved" in said
+    assert memory.read_all() == []
+
+
+def test_remember_with_an_argument_writes_directly():
+    """The explicit path, for when you already know what you want kept."""
+    session = chat.Session(system="SYS")
+
+    chat._handle_command(
+        "/remember He builds for Windows first", session, CFG, fake_terminal(answer="y")
+    )
+
+    assert [m.description for m in memory.read_all()] == ["He builds for Windows first"]
+
+
+def test_remember_with_no_argument_still_proposes():
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "hi")])
+    with mock.patch.object(chat, "_offer_memories") as proposed:
+        chat._handle_command("/remember", session, CFG, lambda *_: None)
+    proposed.assert_called_once()
+
+
+def test_memory_disabled_is_reported_not_silently_skipped():
+    config = config_module.build(
+        {**config_module.DEFAULTS, "memory": {"enabled": False}}
+    )
+    said = []
+    chat._save_memory("a fact", config, fake_terminal(said))
+
+    assert "disabled" in "\n".join(said)
+    assert memory.read_all() == []
+
+
+def test_prose_before_the_marker_is_kept():
+    """The leaked-tool-call branch already did this. The marker branch did not,
+    so anything written before it vanished from the screen, `turns`, `log` and
+    the memory proposer — even when the offer was declined."""
+    reply = "Sure, I can point you at that.\n\nNEEDS_AGENT: list the api folder"
+    took_over, said, session = offer(reply)
+
+    assert took_over is True
+    assert "Sure, I can point you at that." in said
+    assert prompts.NEEDS_AGENT_MARKER not in said
+
+
+def test_the_kept_prose_is_what_gets_stored():
+    reply = "Here is some context.\n\nNEEDS_AGENT: do the thing"
+    _took, _said, session = offer(reply, seeded=True)
+
+    assert "Here is some context." in session.turns[-1].content
+    assert prompts.NEEDS_AGENT_MARKER not in session.log[-1].content
+
+
+def test_both_branches_strip_their_own_marker():
+    """Two paths doing the same job differently is how one of them stays wrong."""
+    assert prompts.strip_needs_agent("prose\n\nNEEDS_AGENT: x") == "prose"
+    assert prompts.strip_tool_call("prose\n\n<tool_call>x</tool_call>") == "prose"
+
+
+def test_a_reply_that_is_only_a_remember_line_stores_something():
+    """It stripped to "" and an empty assistant turn was stored, replayed and
+    resumed as a blank. `send` guards the same case."""
+    cleaned, _said = remembering("REMEMBER: He prefers dark roast.")
+    assert cleaned.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# Every command branch, run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/help", "/context", "/clear", "/remember", "/remember a fact", "/agent",
+     "/agent do a thing", "/build", "/build mytool", "/voice", "/exit", "/nonsense"],
+)
+def test_every_command_branch_survives_being_run(command, tmp_path):
+    """`/build` referenced a parameter that had been renamed out from under it,
+    and 976 tests passed because none of them ran it. A NameError there unwinds
+    out of the REPL and the exit-path save never happens, so the conversation
+    is gone. This is the cheapest thing that would have caught it."""
+    session = chat.Session(
+        system="SYS",
+        turns=[chat.Turn("user", "x"), chat.Turn("assistant", "y")],
+        path=tmp_path / "c.jsonl",
+    )
+    session.log = list(session.turns)
+
+    with mock.patch("majordomo.scaffold.from_chat"), \
+         mock.patch("majordomo.chat.run_agent"), \
+         mock.patch("majordomo.chat.propose", return_value=[]), \
+         mock.patch("majordomo.chat._listen", return_value=None):
+        chat._handle_command(command, session, CFG, fake_terminal(answer="n"))
+
+
+def test_clear_reports_without_a_file_too():
+    """`save` already tolerates a session with no path; naming the file
+    afterwards did not."""
+    said = []
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "x")], path=None)
+
+    chat._handle_command("/clear", session, CFG, fake_terminal(said))
+
+    assert "Saved 1 turns." in "\n".join(said)
+
+
+def test_build_hands_the_terminal_to_the_scaffolder():
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "an idea")])
+    said = []
+
+    with mock.patch("majordomo.scaffold.from_chat") as built:
+        chat._handle_command("/build mytool", session, CFG, fake_terminal(said))
+
+    assert built.call_args.kwargs["write"] is not None
+
+
+# ---------------------------------------------------------------------------
+# One clock
+# ---------------------------------------------------------------------------
+
+
+def test_both_layers_stamp_turns_from_the_same_clock():
+    """Harmless while both were byte-identical — and the moment either is made
+    injectable for testing compaction, the terminal layer and the session model
+    start stamping from different clocks and ordering stops being reliable."""
+    assert chat._now is session_mod._now
+
+
+# ---------------------------------------------------------------------------
+# Ctrl+C means stop, not "no"
+# ---------------------------------------------------------------------------
+
+
+def interrupting(said=None):
+    said = [] if said is None else said
+
+    def ask(_question):
+        raise KeyboardInterrupt
+
+    return chat.Terminal(write=said.append, ask=ask), said
+
+
+def test_an_interrupt_stops_the_memory_review_rather_than_declining_one():
+    from majordomo import memory as memory_mod
+
+    terminal, said = interrupting()
+    session = chat.Session(system="SYS", turns=[chat.Turn("user", "hi")])
+    candidates = [memory_mod.MemoryCandidate(description=f"fact {n}") for n in range(3)]
+
+    with mock.patch("majordomo.chat.propose", return_value=candidates):
+        chat._offer_memories(session, CFG, terminal)
+
+    shown = [line for line in said if "fact" in line]
+    assert len(shown) == 1               # it stopped, it did not move on
+    assert memory.read_all() == []
+
+
+def test_an_interrupt_at_the_agent_offer_keeps_the_conversation():
+    """Ending a conversation over a change of mind about one task would be a
+    worse answer than declining it."""
+    terminal, _said = interrupting()
+    session = chat.Session(system="SYS", turns=[chat.Turn("assistant", "x")])
+    session.log = list(session.turns)
+
+    with mock.patch("majordomo.chat.run_agent") as ran:
+        handled = chat._offer_agent(
+            session, CFG, "NEEDS_AGENT: a task", "a task", terminal
+        )
+
+    assert handled is True
+    ran.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The memory question comes after the answer
+# ---------------------------------------------------------------------------
+
+
+def test_the_marker_is_split_out_without_asking_anything():
+    """Extraction is pure and separate from the asking: the marker must leave
+    the text before anything is shown or stored, and the question must come
+    after, or you approve a memory without seeing what produced it."""
+    cleaned, fact = chat._proposed_memory("Noted.\n\nREMEMBER: He prefers dark roast.")
+
+    assert cleaned == "Noted."
+    assert fact == "He prefers dark roast."
+
+
+def test_an_ordinary_reply_proposes_nothing():
+    cleaned, fact = chat._proposed_memory("Coffee is a matter of taste.")
+    assert cleaned == "Coffee is a matter of taste."
+    assert fact is None
+
+
+def test_a_reply_that_is_only_the_marker_still_stores_something():
+    cleaned, fact = chat._proposed_memory("REMEMBER: He prefers dark roast.")
+    assert cleaned.strip() != ""
+    assert fact == "He prefers dark roast."

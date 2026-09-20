@@ -547,3 +547,37 @@ def test_uninstall_sweeps_retired_task_names():
     assert r"Majordomo\OnBoot" in deleted
     assert r"Majordomo\OnLogon" in deleted
     assert r"Majordomo\OnWake" in deleted
+
+
+def test_safe_print_flushes_the_fallback_branch_too():
+    """`flush=True` was on the print inside the try; the UnicodeEncodeError
+    fallback did a bare write. That branch exists *for* emoji-bearing lines, so
+    the ordering bug survived in exactly the case the flush was added to fix."""
+    from unittest import mock
+
+    from majordomo import cli
+
+    stream = mock.MagicMock()
+    stream.encoding = "cp1252"
+    stream.write.side_effect = None
+
+    with mock.patch("builtins.print", side_effect=UnicodeEncodeError(
+        "cp1252", "x", 0, 1, "no")):
+        cli.safe_print("a briefing with \U0001f916 in it", file=stream)
+
+    stream.write.assert_called_once()
+    stream.flush.assert_called_once()
+
+
+def test_a_closed_stream_in_the_fallback_does_not_raise():
+    from unittest import mock
+
+    from majordomo import cli
+
+    stream = mock.MagicMock()
+    stream.encoding = "cp1252"
+    stream.flush.side_effect = ValueError("closed")
+
+    with mock.patch("builtins.print", side_effect=UnicodeEncodeError(
+        "cp1252", "x", 0, 1, "no")):
+        cli.safe_print("\U0001f916", file=stream)

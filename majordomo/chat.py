@@ -1,59 +1,71 @@
-"""The interactive session — where brainstorming happens.
+"""The interactive session — the loop, the prompt, and what the commands do.
 
-Structurally this is one idea: a frozen prefix plus a growing list of turns.
+The conversation itself lives in ``session.py``: turns, compaction, the file on
+disk. This is the half that touches a person — keys, rendering, the offers, the
+waiting indicator.
 
-    [ system + memory + activity ]   built once at startup, never rebuilt
-    [ user | assistant | user | ... ] appended to on every exchange
+They were one module, and the bugs clustered precisely at the seam between them.
+See ``session.py``'s header for the three worst; the short version is that a
+loop free to reach into ``session.turns[-1]`` and rewrite it will keep doing so,
+and each time the stored conversation and the one on screen drift a little
+further apart.
 
-The freeze is the load-bearing part. The API is stateless, so every turn
-re-sends everything before it — a twenty-turn conversation sends the prefix
-twenty times. Byte-identical, that prefix bills at roughly a tenth; rebuilt each
-turn, or seasoned with a timestamp, it bills in full and nothing tells you.
-``context.py`` explains the ordering; this module's job is to not undo it.
+The rule that fell out of fixing them, and the one to keep: **decide what to
+show first, then store exactly that.** ``agent_report`` and
+``_restate_last_answer`` are both that rule made mechanical.
 
-── ON DEGRADATION ───────────────────────────────────────────────────────────
-A failed request must not cost you the conversation. Losing forty minutes of
-brainstorming to one 503 would be the worst failure this feature has, and it is
-entirely avoidable: the transcript lives here, not on the server. So an
-``LLMError`` prints a warning, drops the unanswered user turn, and returns you
-to the prompt with everything intact.
-
-``MissingApiKey`` is handled the same way here, unlike everywhere else. It is
-unrecoverable and the other commands exit on it — but exiting *this* command
-discards a conversation to fix an environment variable, and the exit-path save
-never runs. The message still names the variable, so it stays as fixable as it
-was; you just do not lose the session finding that out.
+── WHERE THE I/O IS ─────────────────────────────────────────────────────────
+Nothing here reads stdin or writes stdout directly. A ``Terminal`` carries the
+three callables a conversation needs — write, ask, confirm — and the default is
+headless: silence and a refusal. That is what lets ``chat`` be imported by
+something with no console, and what stopped this module importing the CLI for
+``safe_print`` and ``confirm_action``, which had the dependency pointing the
+wrong way round.
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from majordomo.config import Config
-from majordomo.paths import chats_dir
 
-#: Turns kept verbatim when compacting. Enough that the immediate thread of the
-#: conversation survives intact — losing the last few exchanges to a summary is
-#: exactly when a model starts contradicting itself.
-KEEP_RECENT_TURNS = 8
+# Re-exported, not owned. The REPL is one consumer of the conversation model,
+# and callers that already say `chat.Session` keep working — the split is about
+# where the code lives, not about breaking every import in one commit.
+from majordomo.session import (  # noqa: F401
+    KEEP_RECENT_TURNS,
+    MIN_RECENT_TURNS,
+    SUMMARY_MARKER,
+    ChatFailed,
+    Session,
+    Turn,
+    clear,
+    compact,
+    describe_session,
+    estimate_tokens,
+    find_session,
+    latest_transcript,
+    load_turns,
+    match_count,
+    needs_compaction,
+    new_session,
+    save,
+    saved_sessions,
+    send,
+)
 
-#: Never folded away, however large they are: the exchange you are in the middle
-#: of. Compaction that eats the current question produces a model answering
-#: something nobody asked.
-MIN_RECENT_TURNS = 2
-
-#: Prefix identifying a turn as folded notes rather than something anyone said.
-#: `compact` looks for it so a summary is carried forward instead of being
-#: summarised again.
-SUMMARY_MARKER = "[Earlier in this conversation, summarised]"
+# One clock, not two. Both files defined `_now`, identically — harmless until
+# either is made injectable for testing compaction, at which point the
+# terminal layer and the session model start stamping turns from different
+# clocks and the transcript's ordering quietly stops being reliable.
+from majordomo.session import _now  # noqa: F401
 
 HELP = """\
   /context    what memory and activity are loaded
   /clear      start a fresh conversation, keeping the same loaded context
-  /remember   propose what is worth remembering from this conversation
+  /remember [FACT] keep a fact now, or propose some from this conversation
   /build NAME scaffold a repo from this conversation and open Claude Code
   /agent TASK put the agent to work here — it asks before writing or running
   /voice      speak your next message instead of typing it
@@ -62,425 +74,142 @@ HELP = """\
 
 
 @dataclass(frozen=True)
-class Turn:
-    role: str  # "user" | "assistant"
-    content: str
-    at: str = ""
+class Terminal:
+    """Where a conversation puts text and where it gets answers.
 
-    def to_json(self) -> dict:
-        return {"role": self.role, "content": self.content, "at": self.at}
+    Everything else in this module is a pure function of a ``Session`` and a
+    ``Config``. These three callables are the only places it touches a human,
+    and collecting them here means the module never imports the CLI — which it
+    did, for ``safe_print`` and ``confirm_action``, making the dependency point
+    the wrong way.
 
+    The default is **headless**: it writes nowhere and declines everything. A
+    caller that forgets to pass a real one gets silence and a refusal, not an
+    unattended write or a blocked read on a stdin nobody is watching.
 
-@dataclass
-class Session:
-    """One conversation. The system prompt is frozen at construction."""
-
-    system: str
-    turns: list[Turn] = field(default_factory=list)
-    path: Path | None = None
-    #: Set when compaction has folded earlier turns away, so the UI can say so.
-    compactions: int = 0
-    #: True when compaction was needed on the last turn and did not happen. The
-    #: conversation still works; it is growing without a ceiling.
-    compaction_failed: bool = False
-    #: Everything ever said, in order — the durable record, never compacted.
-    #: `turns` is the *working context* and shrinks when compaction folds it;
-    #: this does not. Writing `turns` to disk meant a compaction overwrote the
-    #: transcript with its own summary, destroying the original text. Losing it
-    #: from context is the feature; losing it from disk was data loss.
-    log: list[Turn] = field(default_factory=list)
-    #: One line describing what context was loaded, for ``/context``. Kept here
-    #: so reporting it never rebuilds the prefix — rebuilding is what breaks the
-    #: byte-identical guarantee this whole module is arranged around.
-    context_summary: str = ""
-
-    def messages(self) -> list[dict]:
-        """The full request body: frozen prefix, then every turn in order."""
-        return [{"role": "system", "content": self.system}] + [
-            {"role": t.role, "content": t.content} for t in self.turns
-        ]
-
-    def transcript(self) -> str:
-        """The conversation as plain text, for memory proposals and scaffolding.
-
-        Reads ``log``, not ``turns``. Compaction shrinks the working context on
-        purpose, but this feeds `/remember` and `/build` — the two moments a
-        session decides what to keep permanently. Handing those a summary of
-        what was said, rather than what was said, is the wrong input at exactly
-        the wrong time.
-        """
-        source = self.log or self.turns
-        return "\n\n".join(
-            f"{'Me' if t.role == 'user' else 'Majordomo'}: {t.content}"
-            for t in source
-        )
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-# ---------------------------------------------------------------------------
-# Size and compaction
-# ---------------------------------------------------------------------------
-
-
-def estimate_tokens(session: Session) -> int:
-    """Rough size of the next request. Four chars per token, as in the router."""
-    total = len(session.system)
-    for turn in session.turns:
-        total += len(turn.content)
-    return total // 4
-
-
-def needs_compaction(session: Session, config: Config) -> bool:
-    return estimate_tokens(session) > config.brain.chat_compact_threshold_tokens
-
-
-def _recent_to_keep(session: Session, config: Config) -> int:
-    """How many recent turns can stay verbatim and still leave room to shrink.
-
-    Walks back from the newest turn, taking turns while they fit in half the
-    threshold. Half rather than all of it because compacting down to exactly the
-    limit means compacting again on the very next message.
+    ``agent.run`` already takes ``confirm`` and ``write`` the same way and for
+    the same reason. This is that pattern, with the third callable a
+    conversation also needs.
     """
-    budget = max(config.brain.chat_compact_threshold_tokens // 2, 1)
-    kept = 0
-    used = 0
-    for turn in reversed(session.turns):
-        used += len(turn.content) // 4
-        if used > budget and kept >= MIN_RECENT_TURNS:
-            break
-        kept += 1
-        if kept >= KEEP_RECENT_TURNS:
-            break
-    return max(MIN_RECENT_TURNS, kept)
+
+    #: One line of output.
+    write: Callable[[str], None] = lambda _text: None
+    #: A question, returning whatever was typed. "" means no answer.
+    ask: Callable[[str], str] = lambda _question: ""
+    #: Approval for a tool call the agent wants to make: ``(name, arguments)``.
+    confirm: Callable[[str, dict], bool] = lambda _name, _arguments: False
+
+    def yes(self, question: str) -> bool:
+        """Was the answer to this yes? Anything else, including nothing, is no."""
+        return self.ask(question).strip().lower() in ("y", "yes")
 
 
-def compact(session: Session, config: Config) -> bool:
-    """Fold the older turns into one summary, keeping recent ones verbatim.
+#: Used when a caller passes nothing. Writes nowhere, agrees to nothing.
+HEADLESS = Terminal()
 
-    Deliberately the same shape as ``coordinator.reduce_source``: hand the
-    oversized part to the reducer model, keep a stated note that it happened.
-    Returns whether anything was folded.
 
-    A failed summarisation is not fatal — the conversation continues uncompacted
-    and simply costs more. Dropping turns because a summary call failed would
-    silently lose the thing the user came for.
+class Waiting:
+    """Ticking seconds on one line while a reply is in flight.
 
-    How many turns stay verbatim adapts to how big they are. It used to be a
-    flat eight, with a guard refusing to compact below ten turns — but the
-    *trigger* is token count, so a conversation of four pasted files crossed the
-    threshold, hit the guard, and could never compact again. It just grew until
-    the provider rejected it. Anything that can grow without bound needs its
-    limit expressed in the same units as its trigger.
+    **Seconds, not a spinner.** Measured, chat latency here ranges from 2s to
+    31s on the same prompt; a spinner looks identical at both, while the number
+    tells you whether it is slow or stuck. That is the whole reason this exists
+    — the gap was already survivable, it just gave you nothing to judge.
+
+    Two constraints shape it:
+
+    - **Silent when stdout is not a terminal.** Redirected, a session would fill
+      with timer frames. ``render.supports_ansi`` already answers this question.
+    - **It never competes with the line editor for the cursor.** It runs only
+      while ``send`` is blocking, which is strictly between reads — the editor
+      has returned a line and has not been called again. That ordering is why a
+      carriage return here is safe, and it is the reason to keep this wrapped
+      around ``send`` rather than started anywhere more convenient.
     """
-    from majordomo.llm import LLMError, MissingApiKey, complete
 
-    keep = _recent_to_keep(session, config)
-    if len(session.turns) <= keep:
-        return False
+    #: How often to repaint. Fast enough to look live, slow enough that a
+    #: 30-second wait is not 300 writes.
+    INTERVAL = 0.25
 
-    old = session.turns[:-keep]
-    recent = session.turns[-keep:]
+    def __init__(self, label: str = "thinking", stream=None):
+        import sys
 
-    # A previous summary is carried separately, never re-summarised as if it
-    # were conversation. Folding it back into the body means every compaction
-    # re-compresses the last one: a telephone game, where a 450-character
-    # distillation competes with 6,000-character answers and loses a little each
-    # round. Measured — a fact stated in turn one survived the first compaction
-    # and was gone by the third.
-    carried = ""
-    if old and old[0].content.startswith(SUMMARY_MARKER):
-        carried = old[0].content[len(SUMMARY_MARKER) :].strip()
-        old = old[1:]
-        if not old:
-            return False          # nothing new to fold; leave the notes alone
+        self.label = label
+        self.stream = stream if stream is not None else sys.stdout
+        self._stop = None
+        self._thread = None
+        self._painted = 0
 
-    body = "\n\n".join(
-        f"{'Me' if t.role == 'user' else 'You'}: {t.content}" for t in old
-    )
+    def _enabled(self) -> bool:
+        from majordomo import render
 
-    instructions = (
-        "You are maintaining running notes on a conversation. The notes "
-        "replace the turns they cover, so anything you leave out is gone.\n\n"
-        "Keep:\n"
-        "- Facts the user stated about themselves, their work, their "
-        "preferences or their situation — names, numbers, dates, tools, "
-        "anything they said to remember.\n"
-        "- Decisions made and constraints agreed.\n"
-        "- Questions still open.\n\n"
-        "Drop pleasantries, and explanations the user asked for and received "
-        "— those were answers, not context.\n\n"
-        "Write notes, not prose.\n\n"
-    )
-    if carried:
-        instructions += (
-            "These are the existing notes. Reproduce every fact in them, "
-            "changing one only if the new exchanges below correct it:\n\n"
-            f"{carried}\n\n"
-            "New exchanges to fold in:\n\n"
-        )
-    else:
-        instructions += "Conversation to summarise:\n\n"
+        return self.stream is not None and render.supports_ansi(self.stream)
 
-    try:
-        summary = complete(
-            [{"role": "user", "content": instructions + body}],
-            config.brain,
-            config.brain.reducer_model,
-        )
-    except (LLMError, MissingApiKey):
-        # A summary we cannot get is not fatal — the conversation continues
-        # uncompacted and simply costs more. Raising here would lose it.
-        return False
-
-    cleaned = (summary or "").strip()
-    if not cleaned:
-        return False
-
-    session.turns = [
-        Turn(
-            role="user",
-            content=(
-                f"[Earlier in this conversation, summarised]\n\n{cleaned}"
-            ),
-            at=_now(),
-        ),
-        *recent,
-    ]
-    session.compactions += 1
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Talking
-# ---------------------------------------------------------------------------
-
-
-class ChatFailed(Exception):
-    """The model call failed. The transcript is intact; try again."""
-
-
-def send(session: Session, text: str, config: Config) -> str:
-    """Add a user turn, get a reply, add it. Raises ChatFailed on a bad call.
-
-    On failure the user turn is removed again, so a retry does not stack two
-    copies of the same message into the history.
-    """
-    from majordomo.llm import LLMError, MissingApiKey, complete
-
-    asked_at = _now()
-    session.turns.append(Turn(role="user", content=text, at=asked_at))
-
-    if needs_compaction(session, config):
-        # Recorded rather than discarded. Compaction failing is the one problem
-        # here that gets worse the longer it goes unnoticed: every turn after it
-        # is larger than the last, and the visible symptom arrives only when the
-        # provider rejects the request outright. `/context` reports this.
-        session.compaction_failed = not compact(session, config)
-
-    try:
-        reply = complete(session.messages(), config.brain, config.brain.chat_model)
-    except (LLMError, MissingApiKey) as exc:
-        # MissingApiKey is a bare Exception, not an LLMError. `cmd_do` and
-        # `/agent` were both given guards; this — every ordinary message you
-        # type — was not, so the first one with no key killed the REPL and the
-        # exit-path save() never ran. Treated as ChatFailed because the outcome
-        # is the same from here: the turn is rolled back and you keep the
-        # conversation. The message names the variable, so it is still fixable.
-        session.turns.pop()
-        raise ChatFailed(str(exc)) from exc
-
-    cleaned = (reply or "").strip() or "(empty response)"
-    answer = Turn(role="assistant", content=cleaned, at=_now())
-    session.turns.append(answer)
-    # Appended only now, so a failed call leaves nothing half-written.
-    session.log.append(Turn(role="user", content=text, at=asked_at))
-    session.log.append(answer)
-    return cleaned
-
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
-
-def save(session: Session) -> None:
-    """Write the transcript. Never raises — a chat is worth more than a log."""
-    if session.path is None:
-        return
-    try:
-        session.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(session.path, "w", encoding="utf-8") as fh:
-            for turn in session.log:
-                fh.write(json.dumps(turn.to_json(), ensure_ascii=False) + "\n")
-    except OSError:
-        pass
-
-
-def load_turns(path: Path | str) -> list[Turn]:
-    """Read a saved transcript. Never raises; bad lines are skipped."""
-    target = Path(path)
-    if not target.is_file():
-        return []
-    try:
-        raw = target.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    if raw.startswith("﻿"):
-        raw = raw[1:]
-
-    turns: list[Turn] = []
-    for line in raw.split("\n"):
-        trimmed = line.strip()
-        if not trimmed:
-            continue
+    def _paint(self, text: str) -> None:
+        # Pad to erase the previous frame: "10s" over "9s" would otherwise
+        # leave the stray digit behind.
+        padding = " " * max(0, self._painted - len(text))
         try:
-            decoded = json.loads(trimmed)
-        except ValueError:
-            continue
-        role = decoded.get("role")
-        content = decoded.get("content")
-        if role in ("user", "assistant") and isinstance(content, str):
-            turns.append(
-                Turn(role=role, content=content, at=str(decoded.get("at") or ""))
-            )
-    return turns
+            self.stream.write("\r" + text + padding)
+            self.stream.flush()
+        except (OSError, ValueError):
+            # A closed or detached stream. A progress indicator is never worth
+            # taking the conversation down with it.
+            return
+        self._painted = len(text)
 
+    def _clear(self) -> None:
+        if self._painted:
+            self._paint("")
+            try:
+                self.stream.write("\r")
+                self.stream.flush()
+            except (OSError, ValueError):
+                pass
+            self._painted = 0
 
-def saved_sessions() -> list[Path]:
-    """Every saved transcript, oldest first. Never raises."""
-    directory = chats_dir()
-    if not directory.is_dir():
-        return []
-    try:
-        return sorted(directory.glob("*.jsonl"))
-    except OSError:
-        return []
+    def __enter__(self):
+        if not self._enabled():
+            return self
 
+        import threading
+        import time
 
-def latest_transcript() -> Path | None:
-    """The most recent chat that has anything in it.
+        self._stop = threading.Event()
+        started = time.monotonic()
 
-    Empty ones are skipped rather than returned. ``run`` no longer writes them,
-    but any already on disk would still sort newest and shadow real work — and
-    "resume" restoring nothing is a worse answer than reaching one file further
-    back. Nothing is deleted here; an empty file is ignored, not cleaned up.
-    """
-    for path in reversed(saved_sessions()):
-        if load_turns(path):
-            return path
-    return None
+        def tick():
+            while not self._stop.wait(self.INTERVAL):
+                self._paint(f"  {self.label}… {int(time.monotonic() - started)}s")
 
+        self._thread = threading.Thread(target=tick, daemon=True)
+        self._thread.start()
+        return self
 
-def find_session(session_id: str) -> Path | None:
-    """A saved chat by id or unique prefix, the way ``mj resume`` matches.
-
-    Returns None for both "no match" and "several matches" — the caller reports
-    which, since the two need different advice.
-    """
-    matches = [p for p in saved_sessions() if p.stem.startswith(session_id)]
-    return matches[0] if len(matches) == 1 else None
-
-
-def match_count(session_id: str) -> int:
-    return sum(1 for p in saved_sessions() if p.stem.startswith(session_id))
-
-
-def describe_session(path: Path) -> str:
-    """One line for ``mj chat --list``: when, how long, what it opened with."""
-    turns = load_turns(path)
-    opener = next((t.content for t in turns if t.role == "user"), "")
-    opener = " ".join(opener.split())[:60] or "(empty)"
-    return f"{path.stem}  {len(turns):>3} turns  {opener}"
-
-
-def _new_transcript_path() -> Path:
-    return chats_dir() / f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.jsonl"
-
-
-def new_session(
-    config: Config,
-    resume: bool = False,
-    transcript: Path | None = None,
-) -> Session:
-    """Build a session: frozen prefix, optionally with prior turns restored.
-
-    ``transcript`` names a specific saved chat to continue; ``resume`` without
-    one continues the most recent.
-    """
-    from majordomo import context as context_mod
-    from majordomo import prompts
-
-    ctx = context_mod.build(config)
-    system = prompts.build_chat_system_prompt(ctx.render())
-
-    turns: list[Turn] = []
-    path: Path | None = transcript
-
-    if path is None and resume:
-        path = latest_transcript()
-
-    if path is not None:
-        turns = load_turns(path)
-    else:
-        path = _new_transcript_path()
-
-    session = Session(
-        system=system,
-        turns=turns,
-        log=list(turns),
-        path=path,
-        context_summary=ctx.summary(),
-    )
-
-    # A resumed conversation arrives at full length, because the file is the
-    # record and the record is never compacted. Fold it back down now rather
-    # than on the first message: otherwise every resume re-sends the whole
-    # history once, at full price, before deciding it was too long.
-    if turns and needs_compaction(session, config):
-        session.compaction_failed = not compact(session, config)
-
-    return session
-
-
-def clear(session: Session) -> None:
-    """Start a fresh conversation without leaving, or reloading context.
-
-    The frozen system prefix is deliberately *kept*. Rebuilding it would reread
-    memory and activity and produce different bytes, which breaks the
-    byte-identical guarantee ``context.py`` is arranged around — the whole
-    reason the prefix is assembled once. Clearing is about the turns.
-    """
-    session.turns = []
-    session.log = []
-    session.compactions = 0
-    session.compaction_failed = False
-    session.path = _new_transcript_path()
-
-
-# ---------------------------------------------------------------------------
-# The REPL
-# ---------------------------------------------------------------------------
+    def __exit__(self, *_exc):
+        if self._stop is not None:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+        self._clear()
+        return False
 
 
 def run(
     config: Config,
     resume: bool = False,
     transcript: Path | None = None,
+    terminal: Terminal = HEADLESS,
 ) -> None:
     """The interactive loop. Returns when the user leaves."""
     from majordomo import keys, render as render_mod
-    from majordomo.cli import safe_print
 
     session = new_session(config, resume=resume, transcript=transcript)
 
-    safe_print("Majordomo. /help for commands, /exit to leave.")
-    safe_print(f"({session.context_summary})")
+    terminal.write("Majordomo. /help for commands, /exit to leave.")
+    terminal.write(f"({session.context_summary})")
     if session.turns:
-        safe_print(f"Resumed {len(session.turns)} turns from {session.path.name}.")
-    safe_print("")
+        terminal.write(f"Resumed {len(session.turns)} turns from {session.path.name}.")
+    terminal.write("")
 
     trigger = config.voice.listen_key if config.voice.enabled else ""
 
@@ -488,7 +217,7 @@ def run(
         try:
             typed = keys.read_line("you › ", trigger)
         except (EOFError, KeyboardInterrupt):
-            safe_print("")
+            terminal.write("")
             break
 
         # Two ways in, one path out: the key at the prompt, or /voice typed.
@@ -497,7 +226,7 @@ def run(
         if typed is keys.TRIGGERED or (
             isinstance(typed, str) and typed.strip().lower() == "/voice"
         ):
-            spoken = _listen(config, safe_print)
+            spoken = _listen(config, terminal)
             if spoken is None:
                 continue
             line = spoken
@@ -508,21 +237,39 @@ def run(
             continue
 
         if line.startswith("/"):
-            if _handle_command(line, session, config, safe_print):
+            if _handle_command(line, session, config, terminal):
                 break
             continue
 
         try:
-            reply = send(session, line, config)
+            with Waiting():
+                reply = send(session, line, config)
         except ChatFailed as exc:
-            safe_print(f"\n[the model call failed: {exc}]")
-            safe_print("[your message was not sent — try again]\n")
+            terminal.write(f"\n[the model call failed: {exc}]")
+            terminal.write("[your message was not sent — try again]\n")
             continue
 
-        # Rendered, not raw: models write markdown regardless of instruction,
-        # and literal `**bold**` reads worse than the prose would have.
-        safe_print(f"\nmj  › {render_mod.render(reply)}\n")
+        # Strip the marker first — it was never meant to be read, and
+        # storing it would put the protocol token in the transcript.
+        reply, remember = _proposed_memory(reply)
+        _restate_last_answer(session, reply)
+
+        handled = _offer_agent(session, config, reply, line, terminal)
+        if not handled:
+            # Rendered, not raw: models write markdown regardless of
+            # instruction, and literal `**bold**` reads worse than the
+            # prose would have.
+            terminal.write(f"\nmj  › {render_mod.render(reply)}\n")
         save(session)
+
+        # Asked *after* the answer is on screen. It used to block before it,
+        # so you approved a memory without having seen what produced it.
+        if remember:
+            try:
+                _save_memory(remember, config, terminal)
+            except KeyboardInterrupt:
+                # Declines the memory and stays in the conversation.
+                terminal.write("")
 
     # Guarded, not unconditional. An empty transcript still sorts newest by
     # mtime, so opening the REPL and quitting made *that* the latest session —
@@ -534,11 +281,171 @@ def run(
     # to skip saving. `log` is what `save` writes.
     if session.log:
         save(session)
-        safe_print(f"Saved to {session.path}.")
-        _offer_memories(session, config, safe_print)
+        terminal.write(f"Saved to {session.path}.")
+        _offer_memories(session, config, terminal)
 
 
-def _handle_command(line: str, session: Session, config: Config, write) -> bool:
+def agent_report(outcome) -> str:
+    """What the agent has to show for itself, as one piece of text.
+
+    Built **before** anything is printed or stored, because those two must be
+    the same string. The previous shape decided the stored turn from
+    ``outcome.answer`` and only afterwards printed a salvaged result — so you
+    watched tool output appear while the transcript recorded "(the agent
+    stopped: …)", and the next turn's context and ``--resume`` both lost it.
+
+    Shared with ``cmd_do`` for the same reason ``run_agent`` is shared with
+    ``/agent``: two renderings of one outcome drift.
+    """
+    from majordomo import agent
+
+    if outcome.answer:
+        return outcome.answer
+
+    salvaged = agent.last_result(outcome)
+    if salvaged:
+        # Labelled. Printed bare, a pytest trace reads exactly like the agent's
+        # own answer — and this is reached precisely when there is no answer to
+        # confuse it with.
+        return f"[no summary — the last thing it got back]\n\n{salvaged}"
+
+    if outcome.stopped_because:
+        return f"(the agent stopped: {outcome.stopped_because})"
+    return "(the agent finished without saying anything)"
+
+
+def run_agent(session: Session, config: Config, task: str, terminal: Terminal = HEADLESS) -> None:
+    """Put the agent to work and fold what happened back into the conversation.
+
+    Shared by ``/agent`` and by the hand-off offer, so the two cannot drift. The
+    offer exists precisely to *be* the same thing as typing the command, and a
+    second copy of this would eventually stop being that.
+    """
+    from majordomo import agent
+    from majordomo.llm import MissingApiKey
+
+    try:
+        outcome = agent.run(
+            task, config, confirm=terminal.confirm, write=terminal.write
+        )
+    except MissingApiKey as exc:
+        # `agent.run` swallows LLMError so a half-finished task keeps its trail,
+        # but MissingApiKey is a bare Exception and went straight through —
+        # taking the REPL and the conversation with it. `cmd_do` guards the
+        # identical call; the two paths disagreed.
+        terminal.write(f"[{exc}]")
+        return
+
+    # One string, decided first, then both shown and stored. Anything else
+    # reintroduces the gap this exists to close.
+    report = agent_report(outcome)
+
+    # Fold the result back in. Without this the agent's work is invisible to the
+    # next turn, and you would have to re-explain what just happened to the
+    # thing that was watching it happen.
+    asked = Turn(role="user", content=f"[I asked the agent to: {task}]", at=_now())
+    answered = Turn(role="assistant", content=report, at=_now())
+    # Both lists: `turns` is the working context, `log` is what gets saved.
+    # Appending to `turns` alone silently dropped these from the transcript.
+    session.turns.extend((asked, answered))
+    session.log.extend((asked, answered))
+    save(session)
+
+    terminal.write(f"\n{report}\n")
+    # Only when the report has not already carried it — with nothing to
+    # salvage the report *is* the stop message, and saying it twice reads
+    # as two separate problems.
+    if outcome.stopped_because and outcome.stopped_because not in report:
+        terminal.write(f"[stopped: {outcome.stopped_because}]")
+
+
+def _restate_last_answer(session: Session, content: str) -> None:
+    """Rewrite the assistant turn just stored, in both the context and the record.
+
+    ``send`` appends the reply the moment it arrives, so by the time anything
+    inspects it the raw text is already in ``turns`` *and* ``log``. Suppressing
+    it on screen alone left a bare ``NEEDS_AGENT:`` line — or a leaked tool-call
+    block — replayed to the model next turn, restored by ``--resume``, and
+    handed to the memory proposer at exit. Hidden in the one place it did no
+    harm, kept in every place it did.
+
+    The rule: what is stored is what you were shown.
+    """
+    replacement = Turn(role="assistant", content=content, at=_now())
+    for record in (session.turns, session.log):
+        if record and record[-1].role == "assistant":
+            record[-1] = replacement
+
+
+def _offer_agent(session, config, reply, asked_for, terminal: Terminal = HEADLESS) -> bool:
+    """Offer to hand a request to the agent. Returns whether it took over.
+
+    Chat has no tools, deliberately — the agent reads files freely, with no
+    prompt, and slipping that into the most casual surface you have is not a
+    thing to do silently. But "review that folder" is a perfectly reasonable
+    sentence to say in a conversation, and making you retype it as a command is
+    friction for its own sake. So: it asks, and a `y` runs exactly what
+    ``/agent`` would.
+
+    Two ways in. The model is told to emit ``NEEDS_AGENT: <task>`` when a
+    question genuinely needs the disk — a structural signal, parsed in Python,
+    the same discipline as ``needs_you``. And when it ignores that and writes
+    out a tool call instead, the markup is dropped rather than printed: raw
+    ``<function_call>`` text reads as though something ran.
+    """
+    from majordomo import prompts
+    from majordomo import render as render_mod
+
+    task = prompts.needs_agent(reply)
+    leaked = task is None and prompts.looks_like_a_tool_call(reply)
+    if task is None and not leaked:
+        return False
+
+    # An empty task means the marker arrived carrying nothing. It is still a
+    # hand-off — the alternative is printing the protocol token — so fall back
+    # to what was actually asked for.
+    if not task:
+        task = asked_for
+
+    shown: list[str] = []
+
+    # Whichever branch we are on, keep whatever prose came with it. A model that
+    # wrote three good paragraphs and one stray marker should lose the marker,
+    # not the paragraphs — and declining the offer must not cost you the answer.
+    # The leaked branch always did this; the marker branch did not, and the two
+    # doing the same job differently is how one of them stays wrong.
+    kept = (
+        prompts.strip_tool_call(reply) if leaked else prompts.strip_needs_agent(reply)
+    )
+    if kept:
+        shown.append(render_mod.render(kept))
+    if leaked:
+        shown.append(prompts.NO_TOOLS_HERE)
+
+    shown.append("That needs the agent, which can read and change files here.")
+    shown.append(f"  {task}")
+
+    body = "\n\n".join(shown)
+    terminal.write(f"\nmj  > {body}\n")
+    _restate_last_answer(session, body)
+
+    try:
+        go = terminal.yes("  Run it? [y/N] ")
+    except KeyboardInterrupt:
+        # Declines this offer and returns to the prompt. Letting it through
+        # would end the conversation over a change of mind about one task.
+        terminal.write("")
+        go = False
+
+    if not go:
+        terminal.write("[not run - /agent <task> whenever you want it]\n")
+        return True
+
+    run_agent(session, config, task, terminal)
+    return True
+
+
+def _handle_command(line: str, session: Session, config: Config, terminal: Terminal = HEADLESS) -> bool:
     """Run a /command. Returns True when the loop should end."""
     parts = line.split(maxsplit=1)
     command = parts[0].lower()
@@ -548,17 +455,17 @@ def _handle_command(line: str, session: Session, config: Config, write) -> bool:
         return True
 
     if command == "/help":
-        write(HELP)
+        terminal.write(HELP)
         return False
 
     if command == "/context":
-        write(session.context_summary)
-        write(
+        terminal.write(session.context_summary)
+        terminal.write(
             f"{len(session.turns)} turns, ~{estimate_tokens(session)} tokens"
             + (f", {session.compactions} compaction(s)" if session.compactions else "")
         )
         if session.compaction_failed:
-            write(
+            terminal.write(
                 "  warning: this is over the compaction threshold and could not "
                 "be summarised — it will keep growing. /clear starts fresh."
             )
@@ -567,77 +474,53 @@ def _handle_command(line: str, session: Session, config: Config, write) -> bool:
     if command == "/clear":
         if session.turns:
             save(session)
-            write(f"Saved {len(session.turns)} turns to {session.path.name}.")
+            # `save` already tolerates a session with no file; naming the file
+            # afterwards did not, so a session built without a path crashed on
+            # the report rather than on the write.
+            where = f" to {session.path.name}" if session.path else ""
+            terminal.write(f"Saved {len(session.turns)} turns{where}.")
         clear(session)
-        write("Cleared. Same context loaded, fresh conversation.")
+        terminal.write("Cleared. Same context loaded, fresh conversation.")
         return False
 
     if command == "/remember":
-        _offer_memories(session, config, write)
+        if argument:
+            # The explicit path, for when you already know what you want kept.
+            # Same confirmation as the offer — nothing here writes unasked.
+            try:
+                _save_memory(argument, config, terminal)
+            except KeyboardInterrupt:
+                terminal.write("")
+        else:
+            _offer_memories(session, config, terminal)
         return False
 
-
     if command == "/agent":
-        from majordomo import agent
-        from majordomo.cli import confirm_action
-
         if not argument:
-            write("usage: /agent <what you want done>")
+            terminal.write("usage: /agent <what you want done>")
             return False
-
-        from majordomo.llm import MissingApiKey
-
-        try:
-            outcome = agent.run(argument, config, confirm=confirm_action, write=write)
-        except MissingApiKey as exc:
-            # `agent.run` swallows LLMError so a half-finished task keeps its
-            # trail, but MissingApiKey is a bare Exception and went straight
-            # through — taking the REPL and the conversation with it. `cmd_do`
-            # guards the identical call; the two paths disagreed.
-            write(f"[{exc}]")
-            return False
-
-        # Fold the result back into the conversation. Without this the agent's
-        # work is invisible to the next turn, and you would have to re-explain
-        # what just happened to the thing that was watching it happen.
-        asked = Turn(
-            role="user", content=f"[I asked the agent to: {argument}]", at=_now()
-        )
-        answered = Turn(
-            role="assistant",
-            content=outcome.answer
-            or f"(the agent stopped: {outcome.stopped_because})",
-            at=_now(),
-        )
-        # Both lists: `turns` is the working context, `log` is what gets saved.
-        # Appending to `turns` alone silently dropped these from the transcript.
-        session.turns.extend((asked, answered))
-        session.log.extend((asked, answered))
-        save(session)
-
-        if outcome.answer:
-            write(f"\n{outcome.answer}\n")
-        if outcome.stopped_because:
-            write(f"[stopped: {outcome.stopped_because}]")
+        run_agent(session, config, argument, terminal)
         return False
 
     if command == "/build":
         from majordomo import scaffold
 
         if not argument:
-            write("usage: /build <name>")
+            terminal.write("usage: /build <name>")
             return False
         try:
-            scaffold.from_chat(argument, session.transcript(), config, write=write)
+            scaffold.from_chat(
+                argument, session.transcript(), config, write=terminal.write
+            )
         except scaffold.ScaffoldError as exc:
-            write(f"[{exc}]")
+            terminal.write(f"[{exc}]")
         return False
 
-    write(f"unknown command {command}. /help for the list.")
+    terminal.write(f"unknown command {command}. /help for the list.")
     return False
 
 
-def _listen(config: Config, write) -> str | None:
+def _listen(config: Config, terminal: Terminal = HEADLESS) -> str | None:
     """Record one spoken message. Returns None if nothing usable was captured.
 
     Never raises past here. Voice is an input convenience — losing a spoken
@@ -647,45 +530,99 @@ def _listen(config: Config, write) -> str | None:
     from majordomo import asr
 
     try:
-        text = asr.listen(config.voice, on_start=lambda: write("listening… (speak now)"))
+        text = asr.listen(config.voice, on_start=lambda: terminal.write("listening… (speak now)"))
     except asr.MicrophoneUnavailable as exc:
-        write(f"[no microphone: {exc}]")
+        terminal.write(f"[no microphone: {exc}]")
         return None
     except asr.ASRError as exc:
-        write(f"[could not hear you: {exc}]")
+        terminal.write(f"[could not hear you: {exc}]")
         return None
 
-    write(f"you › {text}")
+    terminal.write(f"you › {text}")
     return text
 
 
-def _offer_memories(session: Session, config: Config, write) -> None:
+def _save_memory(description: str, config: Config, terminal: Terminal = HEADLESS, kind: str = "user") -> bool:
+    """Ask, then write one memory. The single place chat writes to memory.
+
+    Shared by the mid-conversation offer and by ``/remember <text>`` so the two
+    cannot diverge — and so the confirmation is not something either of them can
+    forget. ``propose`` never writes unattended for the same reason: a wrong
+    memory replays into every future conversation that matches it.
+    """
+    from majordomo import memory as memory_mod
+
+    if not config.memory.enabled:
+        terminal.write("[memory is disabled in config]")
+        return False
+
+    terminal.write(f"\n  [{kind}] {description}")
+    if not terminal.yes("  remember this? [y/N] "):
+        return False
+
+    try:
+        written = memory_mod.write_memory(
+            memory_mod.MemoryCandidate(description=description, type=kind)
+        )
+    except memory_mod.MemoryError_ as exc:
+        terminal.write(f"  not saved: {exc}")
+        return False
+
+    terminal.write(f"  saved as {written.name}")
+    return True
+
+
+def _proposed_memory(reply: str) -> tuple[str, str | None]:
+    """Split a reply into what to show and the fact it asked to keep.
+
+    Pure, and separate from the asking on purpose. The marker has to come out of
+    the text *before* anything is printed or stored — it was never meant to be
+    read — but the question about it has to come *after*, or you are approving a
+    memory before you have seen what produced it. One function doing both forced
+    those two moments to be the same one.
+    """
+    from majordomo import prompts
+
+    fact = prompts.wants_remembered(reply)
+    if fact is None:
+        return reply, None
+
+    # A reply that was *only* the marker strips to nothing, and an empty
+    # assistant turn is stored, replayed and resumed as a blank. `send` guards
+    # the same case with "(empty response)".
+    return prompts.strip_remember(reply) or "(noted)", fact
+
+
+def _offer_memories(session: Session, config: Config, terminal: Terminal = HEADLESS) -> None:
     """Propose what to remember. Writes nothing without an explicit yes."""
     from majordomo import memory as memory_mod
 
     if not config.memory.enabled or not session.turns:
         return
 
-    write("\nLooking for anything worth remembering…")
+    terminal.write("\nLooking for anything worth remembering…")
     candidates = propose(session.transcript(), config)
     if not candidates:
-        write("Nothing worth keeping.")
+        terminal.write("Nothing worth keeping.")
         return
 
     for candidate in candidates:
-        write(f"\n  [{candidate.type}] {candidate.description}")
+        terminal.write(f"\n  [{candidate.type}] {candidate.description}")
         try:
-            answer = input("  remember this? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            write("")
+            keep = terminal.yes("  remember this? [y/N] ")
+        except KeyboardInterrupt:
+            # Stops the review. Declining one candidate and moving on to
+            # the next is what an interrupt used to do, and it is not what
+            # an interrupt means.
+            terminal.write("")
             return
-        if answer not in ("y", "yes"):
+        if not keep:
             continue
         try:
             written = memory_mod.write_memory(candidate)
-            write(f"  saved as {written.name}")
+            terminal.write(f"  saved as {written.name}")
         except memory_mod.MemoryError_ as exc:
-            write(f"  not saved: {exc}")
+            terminal.write(f"  not saved: {exc}")
 
 
 def propose(transcript: str, config: Config):

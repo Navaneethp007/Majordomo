@@ -167,8 +167,13 @@ def _run_schtasks(args: list[str]) -> subprocess.CompletedProcess:
         raise TriggerError(f"could not run schtasks: {exc}") from exc
 
 
-def install(python: str | None = None) -> list[str]:
-    """Register all three tasks. Returns the names registered."""
+def install(python: str | None = None) -> tuple[list[str], list[str]]:
+    """Register all three tasks.
+
+    Returns ``(registered, warnings)``. A task that would not register is a
+    warning rather than a failure — refusing everything because one of three
+    was rejected leaves you worse off than the partial install does.
+    """
     if sys.platform != "win32":
         raise TriggerError("wake/boot/login triggers are Windows-only in v1")
 
@@ -210,11 +215,12 @@ def install(python: str | None = None) -> list[str]:
         detail = "; ".join(f"{name}: {err}" for name, err in failed)
         raise TriggerError(detail)
 
-    if failed:
-        for name, err in failed:
-            print(f"warning: could not register {name}: {err}", file=sys.stderr)
-
-    return registered
+    # Returned rather than printed. Deciding *what* happened belongs here;
+    # deciding how to say it belongs to whoever called — the same split
+    # `scaffold.create` and `activity.fetch` already make, and the reason this
+    # module needs no console.
+    warnings = [f"could not register {name}: {err}" for name, err in failed]
+    return registered, warnings
 
 
 def uninstall() -> int:

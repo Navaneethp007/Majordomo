@@ -660,3 +660,68 @@ def test_a_declined_action_is_not_announced_as_if_it_ran(project):
 def test_a_list_command_is_refused_like_its_siblings(project):
     result = tools.run_command(project, command=["echo", "hi"])
     assert "must be a string" in result
+
+
+# ---------------------------------------------------------------------------
+# Work already done is not thrown away to report a failure
+# ---------------------------------------------------------------------------
+
+
+def test_the_last_result_survives_a_failed_model_call(project):
+    """The exact shape of a real failure: the agent runs a command, gets its
+    output, and then loses its next model call. The output is right there."""
+    with mock.patch(
+        "majordomo.llm.complete_with_tools",
+        replies(
+            tool_reply(call("run_command", command="python -c \"print(42)\"")),
+            LLMError("provider rate-limited"),
+        ),
+    ):
+        outcome = agent.run(
+            "count them", CFG, root=project,
+            confirm=agent.always_allow, write=lambda *_: None,
+        )
+
+    assert outcome.answer == ""                       # it never got to summarise
+    assert "42" in agent.last_result(outcome)         # but the answer exists
+
+
+def test_an_error_result_is_not_offered_as_an_answer(project):
+    """A refusal is not a finding."""
+    with mock.patch(
+        "majordomo.llm.complete_with_tools",
+        replies(tool_reply(call("read_file", path="nope.py")), LLMError("down")),
+    ):
+        outcome = agent.run("read it", CFG, root=project, write=lambda *_: None)
+
+    assert agent.last_result(outcome) == ""
+
+
+def test_a_declined_step_is_not_offered_as_an_answer(project):
+    with mock.patch(
+        "majordomo.llm.complete_with_tools",
+        replies(
+            tool_reply(call("write_file", path="x.txt", content="x")),
+            LLMError("down"),
+        ),
+    ):
+        outcome = agent.run(
+            "write it", CFG, root=project,
+            confirm=lambda n, a: False, write=lambda *_: None,
+        )
+
+    assert agent.last_result(outcome) == ""
+
+
+def test_the_newest_useful_result_wins(project):
+    outcome = agent.Outcome(
+        steps=[
+            agent.Step("read_file", {}, "older content"),
+            agent.Step("run_command", {}, "exit code 0\nstdout:\n412"),
+        ]
+    )
+    assert "412" in agent.last_result(outcome)
+
+
+def test_nothing_to_salvage_from_an_empty_run():
+    assert agent.last_result(agent.Outcome()) == ""

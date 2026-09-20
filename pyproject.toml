@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "majordomo"
 version = "0.1.0"
-description = "One spoken briefing of everything that needs you — pull requests, and your live coding sessions"
+description = "A personal assistant for your terminal: talks with your dev context loaded, and acts on it"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Navaneeth Prabha" }]
-keywords = ["briefing", "orchestration", "agents", "tts", "claude-code", "github", "cli"]
+keywords = ["assistant", "agent", "cli", "llm", "tts", "speech", "claude-code", "github"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -39,6 +39,9 @@ nvidia = ["nvidia-riva-client>=2.14"]
 # stdlib way to capture from a microphone, so this is the one new dependency
 # voice costs. Riva handles the transcription itself via the nvidia extra.
 voice = ["sounddevice>=0.4"]
+# Text out of PDFs and Word files. Optional because a text-only install has
+# no business carrying a PDF parser, and the refusal without it is honest.
+documents = ["pypdf>=4.0", "python-docx>=1.1"]
 tray = ["pystray>=0.19", "Pillow>=10.0"]
 dev = ["pytest>=8.0"]
 

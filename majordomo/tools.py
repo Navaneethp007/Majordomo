@@ -78,8 +78,11 @@ TOOLS: dict[str, Tool] = {
     "read_file": Tool(
         name="read_file",
         description=(
-            "Read a text file and return its contents with line numbers. Use "
-            "this before editing anything, so the edit matches what is there."
+            "Read a file and return its contents. Text files come back with "
+            "line numbers; PDFs and Word (.docx) files are converted to text "
+            "for you, so use this for those too rather than reaching for a "
+            "shell command. Read a file before editing it, so the edit matches "
+            "what is actually there."
         ),
         parameters=_obj(path={"type": "string", "description": "Path within the project"}),
     ),
@@ -315,6 +318,96 @@ def _worth_reading(path: Path) -> bool:
     return not any(part in _NOISE for part in path.parts)
 
 
+#: Formats recognised by their first bytes, mapped to what to call them.
+#:
+#: Named rather than lumped together as "binary", because the remedy differs and
+#: the model acts on what it is told. "report.pdf is a PDF" leads somewhere;
+#: "report.pdf is not text" invites a second attempt at the same file.
+_MAGIC = (
+    (b"%PDF-", "a PDF"),
+    (b"PK\x03\x04", "a zip-based file (.docx, .xlsx, .pptx and .zip all look like this)"),
+    (b"\xd0\xcf\x11\xe0", "an old Office file (.doc/.xls/.ppt)"),
+    (b"\x89PNG", "a PNG image"),
+    (b"\xff\xd8\xff", "a JPEG image"),
+    (b"GIF8", "a GIF image"),
+    (b"\x7fELF", "a compiled binary"),
+    (b"\x1f\x8b", "a gzip archive"),
+    (b"SQLite format 3", "a SQLite database"),
+)
+
+#: Magic that is also ordinary text, so it needs corroboration before it means
+#: anything. ``MZ`` is a DOS executable header *and* two printable letters — a
+#: note opening "MZ is the prefix used by PE binaries" was refused by name, and
+#: the refusal tells the model not to retry, so it could not recover. The other
+#: printable signatures here are long enough to be unambiguous on their own.
+_AMBIGUOUS_MAGIC = ((b"MZ", "a Windows executable"),)
+
+#: How much of a file to inspect. A text file's first kilobytes settle it, and
+#: reading the whole of a 400MB binary to decide it is binary is absurd.
+_SNIFF_BYTES = 4096
+
+
+def _decode(raw: bytes) -> str:
+    """Bytes to text, honouring a byte-order mark.
+
+    ``describe_binary`` already decides UTF-16 is text rather than binary, so
+    reading it back as UTF-8 produced a line of characters separated by spaces —
+    technically not a refusal, practically still garbage. Windows tools write
+    UTF-16 with a BOM often enough to be worth the four lines.
+    """
+    boms = (
+        (b"\xff\xfe", "utf-16"),
+        (b"\xfe\xff", "utf-16"),
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+    )
+    for bom, encoding in boms:
+        if raw.startswith(bom):
+            try:
+                return raw.decode(encoding)
+            except (UnicodeDecodeError, ValueError):
+                break
+    return raw.decode("utf-8", errors="replace")
+
+
+def describe_binary(path: Path, head: bytes | None = None) -> str:
+    """What kind of non-text file this is, or ``""`` if it reads as text.
+
+    The reason this exists: ``read_text(errors="replace")`` does not fail on a
+    PDF. It returns the bytes as replacement characters, the model summarises
+    the noise, and you get a confident answer about a document nobody read. A
+    tool that cannot do something must say so — silently returning garbage is
+    the worst of the three options.
+
+    ``head`` lets a caller that has already read the file hand the bytes over
+    rather than have them read a second time.
+    """
+    if head is None:
+        try:
+            with open(path, "rb") as handle:
+                head = handle.read(_SNIFF_BYTES)
+        except OSError:
+            return ""
+
+    for magic, description in _MAGIC:
+        if head.startswith(magic):
+            return description
+
+    # Only believed when something else in the head is non-text.
+    has_nul = b"\x00" in head
+    for magic, description in _AMBIGUOUS_MAGIC:
+        if head.startswith(magic) and has_nul:
+            return description
+
+    # A NUL byte is the classic tell, and the one that catches formats not
+    # listed above. UTF-16 text trips it too — but only a byte-order mark
+    # settles that, because `decode("utf-16")` succeeds on almost any
+    # even-length byte string and happily called a binary blob text.
+    utf16_bom = (b"\xff\xfe", b"\xfe\xff")
+    if b"\x00" in head and not head.startswith(utf16_bom):
+        return "a binary file"
+    return ""
+
+
 def read_file(root: Path, path: str = "", **_ignored) -> str:
     try:
         target = resolve(root, path)
@@ -322,8 +415,28 @@ def read_file(root: Path, path: str = "", **_ignored) -> str:
         return f"ERROR: {exc}"
     if not target.is_file():
         return f"ERROR: no file at {path}"
+
+    # Extraction is tried before the refusal, so a PDF reads as text where the
+    # extra is installed and refuses clearly where it is not. Each failure names
+    # itself — the extra, an encrypted file and a scan need different answers,
+    # and "cannot read it" for all three sends the model in circles.
+    from majordomo import documents
+
+    if documents.can_extract(target):
+        try:
+            return _truncate(documents.extract(target)) or "(no text)"
+        except documents.ExtractionError as exc:
+            return f"ERROR: {exc}"
+
+    kind = describe_binary(target)
+    if kind:
+        return (
+            f"ERROR: {path} is {kind}, not text — I cannot read it. Do not try "
+            f"again with a different tool; tell the user what the file is."
+        )
+
     try:
-        text = target.read_text(encoding="utf-8", errors="replace")
+        text = _decode(target.read_bytes())
     except OSError as exc:
         return f"ERROR: could not read {path}: {exc}"
 
@@ -380,10 +493,20 @@ def grep(
         # print a file's contents one line at a time from outside the project.
         if not within(base, path) or is_sensitive(path):
             continue
+        # Same reason as read_file, one step worse: grep prints matching
+        # *lines*, so a binary file contributes mangled bytes that look like
+        # findings.
+        # Read once. `describe_binary` opened every candidate and then the
+        # search opened it again — and the search used a bare UTF-8 decode, so
+        # the BOM-marked UTF-16 files the sniff deliberately let through came
+        # back as garbage matches.
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw = path.read_bytes()
         except OSError:
             continue
+        if describe_binary(path, head=raw[:_SNIFF_BYTES]):
+            continue
+        lines = _decode(raw).splitlines()
         rel = str(path.relative_to(base)).replace("\\", "/")
         for number, line in enumerate(lines, 1):
             if regex.search(line):

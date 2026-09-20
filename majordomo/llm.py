@@ -24,7 +24,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -72,8 +72,6 @@ MAX_BACKOFF_SECONDS = 8.0
 #: Only the first is worth a retry. See ``_daily_limit``.
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
-#: Markers OpenRouter uses for the account-wide daily allowance.
-_DAILY_MARKERS = ("free-models-per-day", "openrouter_free_tier_daily")
 
 
 #: One pooled client for the process, created on first use.
@@ -98,29 +96,191 @@ def _post(url: str, headers: dict, json: dict, timeout: float) -> httpx.Response
     return _client.post(url, headers=headers, json=json, timeout=timeout)
 
 
-def _daily_limit(response: httpx.Response) -> str:
-    """A human sentence if this is the daily cap, empty string otherwise.
+#: Names for "the whole account is out", as distinct from "this model's pool is
+#: busy". There is no structural signal for that difference — a reset stamp
+#: cannot say whose limit it is — so this is the one place a provider's own
+#: wording genuinely belongs.
+#:
+#: When it stops matching, the cost is bounded: a far-off limit still stops
+#: retrying *this* model and simply tries the fallback once more than it needed
+#: to. It is not the six wasted attempts that depending on it for everything
+#: used to produce.
+_ACCOUNT_WIDE_MARKERS = (
+    "free-models-per-day",
+    "openrouter_free_tier_daily",
+    "per-day",
+    "daily limit",
+    "daily quota",
+)
 
-    Reads the reset stamp out of the body rather than guessing, because "try
-    again later" is not actionable and "back at 05:30" is.
+#: Past this, waiting inside one call is pointless. A shared pool answers
+#: ``retry-after: 5``; anything measured in minutes is a different kind of
+#: limit. Two minutes sits far above the first and far below a daily reset.
+QUOTA_HORIZON_SECONDS = 120
+
+#: The reset stamp, wherever it is written. OpenRouter sends no ``X-RateLimit-*``
+#: as real HTTP headers — confirmed against a live response — so the only copy
+#: is nested inside ``error.metadata.headers`` in the body, and it has to be
+#: read out of the JSON text. Case-insensitive because the casing of a key
+#: inside a JSON body is the provider's whim, not a protocol.
+_RESET_STAMP = re.compile(r'"x-ratelimit-reset"\s*:\s*"?(\d+)"?', re.IGNORECASE)
+
+
+def _reset_seconds(response: httpx.Response) -> float | None:
+    """How long until this limit clears, or None if nothing says.
+
+    Prefers the real ``retry-after`` header, which is a protocol answer, over
+    the reset stamp a provider buried in its JSON. A stamp already in the past
+    means the limit has lifted, which is not a reason to stop.
     """
-    body = response.text[:2000]
-    if not any(marker in body for marker in _DAILY_MARKERS):
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return max(0.0, float(header))
+        except ValueError:
+            pass
+
+    match = _RESET_STAMP.search(response.text[:4000])
+    if match is None:
+        return None
+    try:
+        # Milliseconds since the epoch, as OpenRouter sends it.
+        stamp = datetime.fromtimestamp(int(match.group(1)) / 1000, timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
+    return max(0.0, (stamp - datetime.now(timezone.utc)).total_seconds())
+
+
+def _worth_waiting(response: httpx.Response) -> bool:
+    """Could this limit clear soon enough to retry inside this call?
+
+    The structural half of the question, and the half a reset stamp can answer.
+    Unknown counts as yes: an absent stamp is not evidence of a quota, and
+    refusing to retry on no information is the worse mistake.
+    """
+    seconds = _reset_seconds(response)
+    return seconds is None or seconds <= QUOTA_HORIZON_SECONDS
+
+
+def _daily_limit(response: httpx.Response) -> str:
+    """A sentence if the whole *account* is out of requests, else "".
+
+    Two questions, and three versions of this function got the relationship
+    between them wrong in three different ways:
+
+    - **Will another model help?** Answered by whose limit it is. Only the
+      provider's own wording says that — no reset stamp can. This is the gate.
+    - **Will waiting help?** Answered by the reset distance, which is structural
+      and survives a rename. It refines the *message*, and rules out the case
+      where a "daily" wording arrives on something that clears in seconds.
+
+    The version before this made the distance the gate, and a cap carrying the
+    marker but no reset information came back as "" — because unknown distance
+    counts as "keep waiting", which is right for retrying and wrong here. A body
+    saying ``free-models-per-day`` is a daily cap whether or not anyone said
+    when it lifts. That is the stronger evidence, so it goes first.
+
+    The version before *that* made the marker do both jobs, so a long
+    ``retry-after`` on one model's pool skipped the fallback that would have
+    worked.
+    """
+    body = response.text[:4000].lower()
+    if not any(marker in body for marker in _ACCOUNT_WIDE_MARKERS):
+        return ""
+
+    seconds = _reset_seconds(response)
+
+    # A "daily" wording on something clearing in seconds is a provider being
+    # loose with words, not a spent quota. Only a *known* short distance
+    # overrides the marker; not knowing leaves the marker standing.
+    if seconds is not None and seconds <= QUOTA_HORIZON_SECONDS:
         return ""
 
     when = ""
-    match = re.search(r'"X-RateLimit-Reset"\s*:\s*"?(\d+)"?', body)
-    if match:
-        try:
-            stamp = datetime.fromtimestamp(int(match.group(1)) / 1000, timezone.utc)
-            when = f" It resets at {stamp.astimezone().strftime('%H:%M on %d %b')}."
-        except (ValueError, OSError, OverflowError):
-            when = ""
+    if seconds is not None:
+        stamp = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        when = f" It clears at {stamp.astimezone().strftime('%H:%M on %d %b')}."
 
     return (
-        "Out of free requests for today on this OpenRouter account." + when
+        "Out of free requests for today on this account." + when
         + " Adding credits raises the daily allowance; otherwise wait for the reset."
     )
+
+
+#: String codes OpenAI-compatible providers send in place of a status, mapped
+#: to the status they mean. Dropping a string code left ``code`` as ``None``,
+#: which skipped the non-retryable break — so a certain failure like a bad key
+#: spent all six attempts proving it.
+_STRING_CODES = {
+    "invalid_api_key": 401,
+    "invalid_request_error": 400,
+    "authentication_error": 401,
+    "permission_error": 403,
+    "permission_denied": 403,
+    "model_not_found": 404,
+    "not_found_error": 404,
+    "context_length_exceeded": 400,
+    "invalid_prompt": 400,
+    "rate_limit_error": 429,
+    "rate_limit_exceeded": 429,
+    "overloaded_error": 529,
+    "server_error": 500,
+    "api_error": 500,
+}
+
+
+def _as_status(code) -> int | None:
+    """A provider's error code as an HTTP status, where that is knowable.
+
+    An unrecognised string returns ``None``, which means *retry* — being wrong
+    in that direction costs a few seconds, while being wrong the other way turns
+    a transient failure into a permanent one.
+    """
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        stripped = code.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return _STRING_CODES.get(stripped.lower())
+    return None
+
+
+def _error_envelope(body) -> tuple[str, int | None] | None:
+    """``(message, code)`` if this body is an error wearing a success status.
+
+    OpenRouter answers ``200`` with ``{"error": {...}}`` when an upstream
+    provider dies mid-request. Read as a completion that becomes
+    ``KeyError('choices')``, whose entire string form is ``"'choices'"`` — the
+    least informative possible account of a failure whose cause was sitting
+    right there in the body.
+
+    Two things keep it from firing on a good answer, both learned by it doing
+    exactly that:
+
+    - **A usable completion wins.** Some providers send ``error: {}`` alongside
+      real ``choices``. Treating the key's presence as the signal discarded the
+      answer, retried three times, burned the fallback and raised.
+    - **Empty is not an error.** ``{}``, ``""`` and ``0`` are all falsy and all
+      previously became an "error" whose message was their repr.
+    """
+    if not isinstance(body, dict):
+        return None
+
+    error = body.get("error")
+    if not error:
+        return None
+
+    # A completion that is actually there beats an error key that says nothing
+    # about it. Checked before reading the error, not after.
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return None
+
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("type") or error)
+        return message, _as_status(error.get("code") or error.get("type"))
+    return str(error), None
 
 
 def _retry_after(response: httpx.Response, attempt: int) -> float:
@@ -318,6 +478,13 @@ def _request_one(
                 if exhausted:
                     raise QuotaExhausted(exhausted)
 
+                if not _worth_waiting(response):
+                    # This limit lifts in minutes, not seconds, so retrying the
+                    # same model here is waiting for nothing. The fallback is
+                    # still worth a try — it is a different model, and only an
+                    # account-wide cap (above) makes that pointless too.
+                    break
+
                 if attempt < MAX_ATTEMPTS - 1:
                     # This is the whole point. The old policy retried
                     # immediately, so against a `retry-after: 5` the second
@@ -326,7 +493,43 @@ def _request_one(
                     time.sleep(_retry_after(response, attempt))
                 continue
 
-            choice = response.json()["choices"][0]
+            body = response.json()
+            envelope = _error_envelope(body)
+            if envelope is not None:
+                message, code = envelope
+                # Checked here as well as in the status branch, because the cap
+                # can arrive either way. Reaching it only through the status
+                # branch meant a free-tier cap wearing a 200 was retried six
+                # times across two models and reported as raw JSON — instead of
+                # the sentence naming the reset time.
+                exhausted = _daily_limit(response)
+                if exhausted:
+                    raise QuotaExhausted(exhausted)
+
+                last_exc = Exception(
+                    f"HTTP {response.status_code} carrying an error: {message}"
+                )
+                # A 200 whose body is an error is a failure wearing a success
+                # code, so classify it the way the status *should* have been.
+                # Retrying a permanent one only adds latency to a certain
+                # failure — the same reasoning as the status check above.
+                if code is not None and code not in RETRYABLE_STATUS:
+                    break
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(min(2.0**attempt, MAX_BACKOFF_SECONDS))
+                continue
+
+            if not isinstance(body, dict) or "choices" not in body:
+                # The one case the old comment here anticipated, and the one it
+                # reported worst: `str(KeyError('choices'))` is `"'choices'"`,
+                # which says nothing at all. The body is the only thing that
+                # explains it, so the body goes in the message.
+                raise ValueError(
+                    f"HTTP {response.status_code} but no 'choices' in the "
+                    f"response: {response.text[:300]}"
+                )
+
+            choice = body["choices"][0]
             if not isinstance(choice, dict):
                 raise TypeError("choices[0] was not an object")
             return choice

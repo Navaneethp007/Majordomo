@@ -394,18 +394,6 @@ def test_do_reports_declined_actions(capsys, tmp_path):
     assert "1 action(s) declined" in captured.err
 
 
-def test_do_reports_why_it_stopped(capsys, tmp_path):
-    from majordomo import agent
-
-    with mock.patch(
-        "majordomo.agent.run",
-        return_value=agent.Outcome(stopped_because="reached the 24-step limit"),
-    ):
-        run("do", "loop", "-C", str(tmp_path))
-
-    assert "24-step limit" in capsys.readouterr().err
-
-
 def test_yes_warns_that_it_skips_every_prompt(capsys, tmp_path):
     from majordomo import agent
 
@@ -645,24 +633,198 @@ def test_a_non_interactive_run_says_so_instead_of_declining_everything(capsys, m
     assert "--yes" in capsys.readouterr().err
 
 
-def test_do_warns_when_the_agent_says_nothing(capsys, tmp_path):
+def test_do_says_so_when_the_agent_says_nothing(capsys, tmp_path):
     """No answer, no error, exit 0 — indistinguishable from a task that needed
-    no output. chat.send has guarded this with '(empty response)' all along."""
+    no output. On stdout rather than stderr now, because it is part of the one
+    report that is both shown and stored."""
     from majordomo import agent
 
     with mock.patch("majordomo.agent.run", return_value=agent.Outcome()):
         run("do", "something", "-C", str(tmp_path))
 
-    assert "without saying anything" in capsys.readouterr().err
+    assert "without saying anything" in capsys.readouterr().out
 
 
-def test_do_does_not_double_warn_when_it_stopped_for_a_reason(capsys, tmp_path):
+def test_ask_prints_the_command_instead_of_offering(capsys):
+    """One-shot, so there is nobody to ask — and a raw marker line is not
+    something the user was ever meant to see."""
+    with mock.patch("majordomo.llm.complete", return_value="NEEDS_AGENT: review the repo"):
+        run("ask", "review", "this", "repo", "--no-refresh")
+
+    out = capsys.readouterr().out
+    assert 'mj do "review the repo"' in out
+    assert "NEEDS_AGENT" not in out
+
+
+def test_ask_replaces_leaked_tool_markup(capsys):
+    with mock.patch("majordomo.llm.complete", return_value="<tool_call>ls -la</tool_call>"):
+        run("ask", "what", "is", "in", "that", "folder", "--no-refresh")
+
+    out = capsys.readouterr().out
+    assert "tool_call" not in out
+    assert "mj do" in out
+
+
+def test_ask_leaves_an_ordinary_answer_alone(capsys):
+    with mock.patch("majordomo.llm.complete", return_value="Coffee is a matter of taste."):
+        run("ask", "coffee?", "--no-refresh")
+
+    out = capsys.readouterr().out
+    assert "Coffee is a matter of taste." in out
+    assert "mj do" not in out
+
+
+@pytest.mark.parametrize(
+    "task,expected",
+    [
+        ('find the "TODO" markers', 'mj do "find the \\"TODO\\" markers"'),
+        ("it's here", 'mj do "it\'s here"'),
+        ("plain task", 'mj do "plain task"'),
+    ],
+)
+def test_the_printed_command_can_actually_be_pasted(task, expected, capsys):
+    """Interpolated into double quotes, any task containing one broke:
+    `mj do "find the "TODO" markers"` is three arguments, not one."""
+    with mock.patch(
+        "majordomo.llm.complete", return_value=f"NEEDS_AGENT: {task}"
+    ):
+        run("ask", "do", "it", "--no-refresh")
+
+    assert expected in capsys.readouterr().out
+
+
+def test_ask_does_not_advertise_a_chat_it_is_not_in(capsys):
+    """NO_TOOLS_HERE used to say "without leaving this chat" — but `mj ask` is
+    one-shot, and two different instructions in one output is worse than none."""
+    with mock.patch("majordomo.llm.complete", return_value="<tool_call>ls</tool_call>"):
+        run("ask", "what", "is", "in", "there", "--no-refresh")
+
+    out = capsys.readouterr().out
+    assert "/agent" not in out
+    assert out.count("mj do") == 1
+
+
+def test_ask_keeps_the_prose_that_came_with_a_leaked_block(capsys):
+    reply = "Here is what I can tell you.\n\n<tool_call>ls</tool_call>"
+    with mock.patch("majordomo.llm.complete", return_value=reply):
+        run("ask", "look", "--no-refresh")
+
+    out = capsys.readouterr().out
+    assert "Here is what I can tell you." in out
+    assert "tool_call" not in out
+
+
+def test_do_prints_what_the_agent_found_when_it_stops_early(capsys, tmp_path):
+    """Printing only `answer` discarded work the tool had already done — a
+    command was run, its output captured, and then a failure reported instead."""
+    from majordomo import agent
+
+    outcome = agent.Outcome(
+        steps=[agent.Step("run_command", {}, "exit code 0\nstdout:\n412\n268\n93")],
+        stopped_because="the model call failed: rate-limited",
+    )
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        run("do", "count the lines", "-C", str(tmp_path))
+
+    captured = capsys.readouterr()
+    assert "412" in captured.out                  # you get the numbers
+    assert "rate-limited" in captured.err         # and still hear why it stopped
+
+
+def test_do_prefers_a_real_answer_over_a_salvaged_result(capsys, tmp_path):
+    from majordomo import agent
+
+    outcome = agent.Outcome(
+        answer="There are 773 lines in total.",
+        steps=[agent.Step("run_command", {}, "raw tool output")],
+    )
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        run("do", "count", "-C", str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "773 lines" in out
+    assert "raw tool output" not in out
+
+
+def test_the_quoting_caveat_appears_only_when_it_applies(capsys):
+    """A caveat on every command would be ignored by the time it mattered."""
+    with mock.patch("majordomo.llm.complete", return_value="NEEDS_AGENT: plain task"):
+        run("ask", "do", "it", "--no-refresh")
+    assert "cmd.exe" not in capsys.readouterr().out
+
+    with mock.patch(
+        "majordomo.llm.complete", return_value='NEEDS_AGENT: find the "TODO" markers'
+    ):
+        run("ask", "do", "it", "--no-refresh")
+    assert "cmd.exe" in capsys.readouterr().out
+
+
+def test_single_quotes_are_never_used(capsys):
+    """Correct in bash and PowerShell, and wrong in cmd.exe, which has no
+    single-quote syntax and passes them through literally."""
+    from majordomo import cli as cli_mod
+
+    quoted = cli_mod._shell_quote('find the "TODO" markers')
+    assert not quoted.startswith("'")
+    assert quoted.startswith('"') and quoted.endswith('"')
+
+
+def test_the_stop_reason_is_not_said_twice(capsys, tmp_path):
+    """With nothing to salvage the report *is* the stop message, and printing
+    it on both streams reads as two separate problems."""
     from majordomo import agent
 
     outcome = agent.Outcome(stopped_because="reached the 24-step limit")
     with mock.patch("majordomo.agent.run", return_value=outcome):
         run("do", "loop", "-C", str(tmp_path))
 
-    err = capsys.readouterr().err
-    assert "24-step limit" in err
-    assert "without saying anything" not in err
+    captured = capsys.readouterr()
+    assert "24-step limit" in captured.out
+    assert "24-step limit" not in captured.err
+
+
+def test_the_stop_reason_still_reaches_stderr_when_there_is_other_output(capsys, tmp_path):
+    """The exit status is 0 either way, so stderr is how a script notices."""
+    from majordomo import agent
+
+    outcome = agent.Outcome(
+        steps=[agent.Step("run_command", {}, "412")],
+        stopped_because="the model call failed",
+    )
+    with mock.patch("majordomo.agent.run", return_value=outcome):
+        run("do", "count", "-C", str(tmp_path))
+
+    captured = capsys.readouterr()
+    assert "412" in captured.out
+    assert "the model call failed" in captured.err
+
+
+def test_ask_keeps_prose_written_before_the_marker(capsys):
+    """Fixed in chat.py a round earlier; cli.py never used strip_needs_agent,
+    so the two paths disagreed in the same way a second time."""
+    reply = "Here is some context.\n\nNEEDS_AGENT: list the api folder"
+    with mock.patch("majordomo.llm.complete", return_value=reply):
+        run("ask", "look", "--no-refresh")
+
+    out = capsys.readouterr().out
+    assert "Here is some context." in out
+    assert "NEEDS_AGENT" not in out
+    assert "mj do" in out
+
+
+def test_an_interrupt_is_not_an_answer(monkeypatch):
+    """Swallowing Ctrl+C in `ask` collapsed "declined" and "interrupted" into
+    one value, and a loop then declined one item and asked about the next."""
+    from majordomo import cli as cli_mod
+
+    monkeypatch.setattr("builtins.input", mock.Mock(side_effect=KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        cli_mod.ask("well? ")
+
+
+def test_end_of_input_still_is_an_answer(monkeypatch, capsys):
+    """Nobody is there, which every caller treats as a refusal."""
+    from majordomo import cli as cli_mod
+
+    monkeypatch.setattr("builtins.input", mock.Mock(side_effect=EOFError))
+    assert cli_mod.ask("well? ") == ""

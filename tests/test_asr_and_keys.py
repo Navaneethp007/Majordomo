@@ -377,21 +377,21 @@ def test_ctrl_m_cannot_be_distinguished_from_enter():
 def test_a_missing_microphone_returns_you_to_typing():
     said = []
     with mock.patch.object(asr, "listen", side_effect=asr.MicrophoneUnavailable("no mic")):
-        assert chat._listen(CFG, said.append) is None
+        assert chat._listen(CFG, chat.Terminal(write=said.append)) is None
     assert "no microphone" in said[0]
 
 
 def test_a_failed_transcription_returns_you_to_typing():
     said = []
     with mock.patch.object(asr, "listen", side_effect=asr.ASRError("heard nothing")):
-        assert chat._listen(CFG, said.append) is None
+        assert chat._listen(CFG, chat.Terminal(write=said.append)) is None
     assert "could not hear you" in said[0]
 
 
 def test_a_successful_transcription_is_echoed_and_returned():
     said = []
     with mock.patch.object(asr, "listen", return_value="what did I ship"):
-        assert chat._listen(CFG, said.append) == "what did I ship"
+        assert chat._listen(CFG, chat.Terminal(write=said.append)) == "what did I ship"
     assert "what did I ship" in said[0]
 
 

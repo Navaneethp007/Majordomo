@@ -73,6 +73,25 @@ class Outcome:
         )
 
 
+def last_result(outcome) -> str:
+    """What the agent found before it stopped, if it never got to say it.
+
+    An agent that runs a command and then loses its next model call still *has*
+    the output — it is sitting in the last step. Printing only ``answer`` threw
+    that away and reported a failure instead, which is backwards: the tool had
+    done the work and the summary was the only part missing.
+
+    Only the last step, and only its result. Earlier steps were inputs to a plan
+    that never finished; the newest one is what the task was actually reaching
+    for. Nothing is inferred about whether it *is* the answer — it is labelled
+    as what it is, so you can judge.
+    """
+    for step in reversed(outcome.steps):
+        if step.approved and step.result and not step.result.startswith("ERROR"):
+            return step.result
+    return ""
+
+
 def always_allow(_name: str, _arguments: dict) -> bool:
     """A confirmer that approves everything. For tests, and read-only runs."""
     return True

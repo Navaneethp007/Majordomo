@@ -1,5 +1,6 @@
 """Prompt assembly. Pure string building — no I/O, so it is trivially testable."""
 from __future__ import annotations
+import re
 
 from majordomo.models import SourceReport
 
@@ -11,6 +12,11 @@ _VOICE = (
 )
 
 
+#: What the model emits instead of answering when the question needs the disk.
+#: Parsed in Python by ``needs_agent`` — the caller then offers to hand it to
+#: the agent, which is the only thing here that can actually read a file.
+NEEDS_AGENT_MARKER = "NEEDS_AGENT:"
+
 #: The assistant voice, as distinct from the briefing voice above. The briefing
 #: is read aloud to someone who just sat down; this is a conversation with
 #: someone who is working. Different job, different register.
@@ -20,8 +26,7 @@ _VOICE = (
 #: does not answer it, say so rather than guessing" — written about *activity*.
 #: The model applied it to everything, so "who is the president of India" came
 #: back opening with "I don't have that in my cache". A guardrail scoped wider
-#: than the risk it guards against makes the assistant useless at the ordinary
-#: half of its job.
+#: than the risk it guards against makes the assistant useless at the ordinary half of its job.
 _ASSISTANT = (
     "You are Majordomo, a personal assistant to a developer. Below you have "
     "what you have learned about him over time and his recent GitHub "
@@ -44,6 +49,234 @@ _ASSISTANT = (
     "thing to reason from."
 )
 
+#: Appended for chat and `mj ask`, which have no tools. Not for the memory
+#: proposal, which has its own strict output format and no reason to be told
+#: about a protocol it must never use.
+#:
+#: The ordering inside matters and was measured. With context loaded, an earlier
+#: version lost to the "questions about him use the context below" rule: asked
+#: to look in a folder, the model reported the folder was absent from its
+#: context — true, irrelevant, and not what was asked. Saying which rule wins is
+#: what stopped that.
+_NO_TOOLS = (
+    "\n\n**You cannot read files, list directories, or run commands.** There is "
+    "no tool here and no access to his machine.\n\n"
+    "When answering would require looking at a file, a directory or a "
+    "repository, your **entire reply** is this one line:\n\n"
+    f"    {NEEDS_AGENT_MARKER} <the task, phrased for a coding agent>\n\n"
+    "No preamble, no apology, no code fence, nothing after it. Something else "
+    "acts on that line and hands the work to an agent that genuinely can look. "
+    "Never offer to have files pasted to you instead, and never emit a tool "
+    "call or anything shaped like one — it does not run, and it reads as though "
+    "something happened when nothing did.\n\n"
+    "Where he asks you to **open something on disk**, this outranks the rule "
+    "about his context above: do not answer such a request by reporting that "
+    "the file or folder is absent from your context — true, and not what was "
+    "asked.\n\n"
+    "That is a narrow exception, not a general one. "
+    "\"What have I been doing in <repo>?\" is a question about his activity and "
+    "you answer it from context as usual. Only a request to *look inside* "
+    "something — read this file, list that directory, check what is in there — "
+    "goes to the agent.\n\n"
+    "Example:\n"
+    "  Him: what is in the api folder?\n"
+    f"  You: {NEEDS_AGENT_MARKER} list and summarise the contents of the api folder"
+    "\n\n"
+    "Only for requests that really need the filesystem. A question you can "
+    "answer from context or general knowledge is not one of those."
+)
+
+
+#: What the model emits when you ask it to keep something. Parsed in Python by
+#: ``wants_remembered``, then offered — never written unattended. A wrong memory
+#: replays into every future conversation that matches it, which is why
+#: ``build_memory_proposal_prompt`` never writes either.
+REMEMBER_MARKER = "REMEMBER:"
+
+#: Appended alongside ``_NO_TOOLS`` for chat. Not for `mj ask`: one-shot, so
+#: there is nobody to confirm to, and a marker nobody acts on would print.
+_REMEMBER = (
+    "\n\nWhen he asks you to remember something — \"remember this\", \"keep that "
+    "in mind\", \"note that I prefer X\" — end your reply with a line of its "
+    "own:\n\n"
+    f"    {REMEMBER_MARKER} <the fact, in one sentence, written about him>\n\n"
+    "Answer him normally first; this line goes last. Something else acts on it "
+    "and asks him before anything is saved, so do not claim you have saved "
+    "anything.\n\n"
+    "Only for facts that will still be true in six months — preferences, how he "
+    "works, what his projects are. Not a passing detail of the conversation you "
+    "are already having, and never a credential."
+)
+
+
+def wants_remembered(reply: str) -> str | None:
+    """The fact the model wants kept, if it asked for one.
+
+    Structural, like ``needs_agent``: a marker the model was told to emit,
+    parsed here. Whether a sentence "sounds like" the user asked to be
+    remembered is not something to branch on.
+    """
+    if REMEMBER_MARKER not in reply:
+        return None
+    _, _, rest = reply.partition(REMEMBER_MARKER)
+    for line in rest.splitlines():
+        fact = line.strip().strip("`").strip()
+        if fact:
+            return fact
+    return None
+
+
+def strip_remember(reply: str) -> str:
+    """The reply without the marker line, which was never meant to be read."""
+    if REMEMBER_MARKER not in reply:
+        return reply
+    head, _, _ = reply.partition(REMEMBER_MARKER)
+    return head.rstrip()
+
+
+def needs_agent(reply: str) -> str | None:
+    """The task the model wants handed to the agent, if it asked for one.
+
+    A **structural** signal, not prose-sniffing. The same discipline as
+    ``needs_you`` in the briefing: the decision is made in Python from a marker
+    the model was told to emit, never inferred from how a sentence reads. "It
+    sounds like it is refusing" is not something to branch on.
+
+    Three outcomes, and the middle one matters: ``None`` for an ordinary
+    answer (the common path, costing one ``in``), the task where there is
+    one, and ``""`` where the marker appeared but carried nothing — still a
+    hand-off, because the alternative is printing the marker.
+    """
+    if NEEDS_AGENT_MARKER not in reply:
+        return None
+
+    _, _, rest = reply.partition(NEEDS_AGENT_MARKER)
+    # The task may sit on the marker's line or the one after it. Reading only
+    # the marker's own line returned None for `NEEDS_AGENT:\n<task>`, and a
+    # None here means no offer fires and the raw reply prints — putting the
+    # protocol token on screen, which is the single outcome it exists to
+    # prevent. Blank lines are skipped for the same reason.
+    for line in rest.splitlines():
+        task = line.strip().strip("`").strip()
+        if task:
+            return task
+
+    # The marker was there and carried nothing. Still a hand-off: the caller
+    # falls back to what the user asked for. Returning None would print the
+    # marker.
+    return ""
+
+
+def strip_needs_agent(reply: str) -> str:
+    """The reply without the marker line, keeping anything written before it.
+
+    The sibling path for a leaked tool call already did this — kept the
+    paragraphs, lost the block. This one did not, so prose written before the
+    marker was dropped from the screen, from ``turns``, from ``log`` and from
+    the memory proposer, even when the offer was declined. Two paths doing the
+    same job disagreed, and the one with no stripping was the original.
+    """
+    if NEEDS_AGENT_MARKER not in reply:
+        return reply
+    head, _, _ = reply.partition(NEEDS_AGENT_MARKER)
+    return head.rstrip()
+
+
+#: A tool call the model *emitted*, as opposed to one it is talking about.
+#:
+#: The distinction is the whole point. A substring net over the reply flagged
+#: ordinary answers — and this project is itself an LLM tool, so "how do tool
+#: calls work?" is a question you will actually ask:
+#:
+#:     The Anthropic API uses <invoke name="get_weather"> in its examples.
+#:
+#: Two rules, and both were learned by getting it wrong:
+#:
+#: 1. **The opening token must start a line.** A mention sits inside a sentence.
+#: 2. **It must not be inside a code fence.** This is the one that took two
+#:    attempts. Allowing an optional fence *prefix* did nothing, because the
+#:    token still starts its own line within the block — so "a tool call looks
+#:    like this: ```<tool_call>…```" was flagged and the answer truncated at the
+#:    fence. Fenced content is quoted precisely because it is an illustration.
+#:
+#: False negatives are cheap — the text simply shows as written. A false
+#: positive throws away a correct answer.
+_EMITTED_CALL = re.compile(
+    r"^[^\S\n]*"
+    r"(?:<\|?[a-z_]*(?:function|tool)[a-z_]*(?:_call)?[|>=\s]"
+    r"|<invoke\s+name\s*="
+    r"|<function\s*="
+    r"|\{\s*\"tool_calls\"\s*:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_FENCE_LINE = re.compile(r"^[^\S\n]*```", re.MULTILINE)
+
+
+def _outside_fences(text: str) -> str:
+    """``text`` with fenced blocks blanked out, offsets preserved.
+
+    Blanked rather than removed so a match position in the result is a valid
+    position in the original — ``strip_tool_call`` cuts the real string at an
+    index found here.
+    """
+    out = list(text)
+    inside = False
+    start = 0
+    for line in text.splitlines(keepends=True):
+        end = start + len(line)
+        fenced = _FENCE_LINE.match(line) is not None
+        if inside or fenced:
+            for i in range(start, end):
+                if out[i] != "\n":
+                    out[i] = " "
+        if fenced:
+            inside = not inside
+        start = end
+    return "".join(out)
+
+
+def _emitted_call_at(text: str):
+    """The match for a call the model actually emitted, or None."""
+    return _EMITTED_CALL.search(_outside_fences(text))
+
+
+def looks_like_a_tool_call(text: str) -> bool:
+    """Did the model write out a tool call instead of answering?
+
+    Chat and `mj ask` deliberately have no tools — `/agent` and `mj do` are the
+    paths that do. Asked to read a file, a model may still produce a block of
+    provider-specific call syntax, which lands raw in the terminal and reads as
+    though something ran. Nothing did.
+
+    Observed with dots-3, which emitted a ``<dots_function_call>`` block
+    complete with a shell command when asked to look inside a folder.
+    """
+    return _emitted_call_at(text) is not None
+
+
+def strip_tool_call(text: str) -> str:
+    """The reply with an emitted call removed, keeping everything else.
+
+    Replacing the whole message loses real content: a model that wrote three
+    good paragraphs and one stray ``<function_call>`` block should cost you the
+    block, not the paragraphs. Drops from the first line that opens a call to
+    the end, because everything after it is the call's arguments and closing
+    tags rather than prose.
+    """
+    match = _emitted_call_at(text)
+    if match is None:
+        return text.strip()
+    return text[: match.start()].strip()
+
+
+#: Shown in place of that block. Says what happened and what to do instead —
+#: the request itself is reasonable, it was simply made of the wrong command.
+NO_TOOLS_HERE = (
+    "I started to call a tool, but this is a plain conversation — I cannot "
+    "read files or run commands here, so nothing happened."
+)
+
 
 def build_ask_prompt(context_text: str, question: str) -> list[dict]:
     """One-shot question against everything known.
@@ -55,7 +288,7 @@ def build_ask_prompt(context_text: str, question: str) -> list[dict]:
     """
     content = f"{context_text}\n\n---\n\n{question}" if context_text else question
     return [
-        {"role": "system", "content": _ASSISTANT},
+        {"role": "system", "content": _ASSISTANT + _NO_TOOLS},
         {"role": "user", "content": content},
     ]
 
@@ -66,9 +299,10 @@ def build_chat_system_prompt(context_text: str) -> str:
     Returned as one system string rather than a message list because the caller
     holds the growing turn list and must be able to keep this part unchanged.
     """
+    system = _ASSISTANT + _NO_TOOLS + _REMEMBER
     if not context_text:
-        return _ASSISTANT
-    return f"{_ASSISTANT}\n\n---\n\n{context_text}"
+        return system
+    return f"{system}\n\n---\n\n{context_text}"
 
 
 def build_memory_proposal_prompt(transcript: str) -> list[dict]:
