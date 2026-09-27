@@ -261,7 +261,7 @@ what was stored differing from what you were shown.
 pytest
 ```
 
-1074 tests. The suite covers the safety properties directly — path confinement, the
+1080 tests. The suite covers the safety properties directly — path confinement, the
 confirmation gate, what compaction keeps — because those are the parts where being wrong
 is expensive rather than merely annoying.
 
