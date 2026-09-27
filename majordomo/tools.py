@@ -294,12 +294,24 @@ def resolve(root: Path, candidate: str) -> Path:
     return target
 
 
+#: The notice ``_truncate`` appends. Named so a caller can *ask* whether a result
+#: was cut rather than reasoning about its length: comparing against
+#: ``MAX_RESULT_CHARS`` is arithmetic about a side effect, and gets the boundary
+#: wrong for a body that is exactly the limit and was never truncated.
+TRUNCATION_NOTICE = f"… truncated at {MAX_RESULT_CHARS} characters."
+
+
+def was_truncated(text: str) -> bool:
+    """Did ``_truncate`` cut this? The fact, rather than an inference from it."""
+    return TRUNCATION_NOTICE in text
+
+
 def _truncate(text: str) -> str:
     if len(text) <= MAX_RESULT_CHARS:
         return text
     return (
         text[:MAX_RESULT_CHARS]
-        + f"\n… truncated at {MAX_RESULT_CHARS} characters. "
+        + f"\n{TRUNCATION_NOTICE} "
         "Narrow the request — a line range, a tighter pattern — to see more."
     )
 

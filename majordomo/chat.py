@@ -65,6 +65,7 @@ from majordomo.session import _now  # noqa: F401
 HELP = """\
   /context    what memory and activity are loaded
   /clear      start a fresh conversation, keeping the same loaded context
+  /read PATH  hand it a file — text, PDF or Word — to talk about
   /remember [FACT] keep a fact now, or propose some from this conversation
   /build NAME scaffold a repo from this conversation and open Claude Code
   /agent TASK put the agent to work here — it asks before writing or running
@@ -330,7 +331,7 @@ def run_agent(session: Session, config: Config, task: str, terminal: Terminal = 
     offer exists precisely to *be* the same thing as typing the command, and a
     second copy of this would eventually stop being that.
     """
-    from majordomo import agent
+    from majordomo import agent, render as render_mod
     from majordomo.llm import MissingApiKey
 
     try:
@@ -360,7 +361,17 @@ def run_agent(session: Session, config: Config, task: str, terminal: Terminal = 
     session.log.extend((asked, answered))
     save(session)
 
-    terminal.write(f"\n{report}\n")
+    # Rendered for the screen, stored raw above. `cmd_do` renders the very same
+    # report and this did not, so `**Hotel:**` and `## Summary` reached the
+    # terminal as literal markdown from `/agent` while `mj do` showed them
+    # properly. `agent_report`'s own docstring says it exists because "two
+    # renderings of one outcome drift" — the *text* was shared, the rendering was
+    # not, so they drifted anyway one layer up.
+    #
+    # The order matters as much as the call: what is stored must stay raw
+    # markdown. Storing the rendered string would put ANSI escapes in the
+    # transcript and send them back to the model on the next turn.
+    terminal.write(f"\n{render_mod.render(report)}\n")
     # Only when the report has not already carried it — with nothing to
     # salvage the report *is* the stop message, and saying it twice reads
     # as two separate problems.
@@ -411,7 +422,7 @@ def _offer_agent(session, config, reply, asked_for, terminal: Terminal = HEADLES
 
     shown: list[str] = []
     if handoff.kept:
-        shown.append(render_mod.render(handoff.kept))
+        shown.append(handoff.kept)
     if handoff.leaked:
         shown.append(prompts.NO_TOOLS_HERE)
 
@@ -419,8 +430,14 @@ def _offer_agent(session, config, reply, asked_for, terminal: Terminal = HEADLES
     shown.append("That needs the agent, which can read and change files here.")
     shown.append(f"  {task}")
 
+    # Built raw, rendered only on the way to the screen. `kept` used to be
+    # rendered *into* `body`, which then went to `_restate_last_answer` — so the
+    # stored turn held ANSI escape sequences, the transcript kept them, and the
+    # next turn sent them back to the model. Same fault as `run_agent`'s missing
+    # render, one layer over: the two must be the same text, and the rendering is
+    # not part of the text.
     body = "\n\n".join(shown)
-    terminal.write(f"\nmj  > {body}\n")
+    terminal.write(f"\nmj  > {render_mod.render(body)}\n")
     _restate_last_answer(session, body)
 
     try:
@@ -437,6 +454,90 @@ def _offer_agent(session, config, reply, asked_for, terminal: Terminal = HEADLES
 
     run_agent(session, config, task, terminal)
     return True
+
+
+def read_into(session: Session, path: str, terminal: Terminal = HEADLESS) -> bool:
+    """Put a file's text into the conversation. Returns whether anything landed.
+
+    ── WHY THIS IS NOT A TOOL ───────────────────────────────────────────────
+    Chat has no tools, deliberately — the agent reads files freely and slipping
+    that into the most casual surface there is would not be a thing to do
+    quietly. But ``/read`` is not the agent choosing a path: it is you naming
+    one. The whole reason the agent is confined to a project directory is that a
+    *model* picked the path, and that reason does not apply here, so this reads
+    wherever you point it.
+
+    What does still apply is the credential denylist. A read ships the contents
+    to a model provider, so ``.env`` and friends are refused exactly as they are
+    for the agent — which is why this goes through ``tools.read_file`` rather
+    than opening the file itself. That also brings PDF and .docx extraction, the
+    binary refusal, and the 8,000-character cap, none of which is worth a second
+    implementation. The cap is what makes this safe to put in a conversation at
+    all: without it a forty-page PDF would blow the compaction threshold on the
+    first turn and sit in the transcript for good.
+    """
+    from pathlib import Path as _Path
+
+    from majordomo import render as render_mod, tools
+
+    if not path:
+        terminal.write("usage: /read <path to a file>")
+        return False
+
+    target = _Path(path.strip().strip('"').strip("'")).expanduser()
+    if not target.exists():
+        terminal.write(f"[no file at {target}]")
+        return False
+    if target.is_dir():
+        terminal.write(f"[{target} is a directory]")
+        return False
+
+    # The parent as the root, so confinement is satisfied by construction while
+    # the sensitive-file refusal inside `resolve` still runs.
+    body = tools.read_file(target.parent, target.name)
+
+    if body.startswith("ERROR: "):
+        terminal.write(f"[{body[len('ERROR: '):]}]")
+        return False
+
+    # A `user` turn, because there is no tool call to hang a `tool` turn on — and
+    # that is exactly why the body is fenced. The agent's reads come back as
+    # `role: "tool"`, a channel the model knows is machine output; this arrives in
+    # the highest-trust channel there is, so the fence and the system framing are
+    # what restore the distinction. See `prompts.wrap_document`.
+    from majordomo import prompts
+
+    content = prompts.wrap_document(target.name, body)
+    turn = Turn(role="user", content=content, at=_now())
+    session.turns.append(turn)
+    session.log.append(turn)
+    save(session)
+
+    terminal.write(f"[read {target.name} — {len(body):,} characters]")
+    # Asked of the text, not inferred from its length. `MAX_RESULT_CHARS <=
+    # len(body)` was arithmetic about a side effect, and claimed a truncation that
+    # had not happened for a body of exactly the limit.
+    if tools.was_truncated(body):
+        terminal.write(
+            f"[truncated at {tools.MAX_RESULT_CHARS:,} — ask for a specific part "
+            f"if you need more, or use /agent to have it search the file]"
+        )
+    terminal.write(f"\n{render_mod.render(_preview(body))}\n")
+    return True
+
+
+#: Lines of a freshly-read file to echo back. Enough to confirm it is the right
+#: document and that the text came out intact — a scanned PDF that extracted to
+#: noise is obvious here and invisible in a character count.
+PREVIEW_LINES = 8
+
+
+def _preview(body: str) -> str:
+    lines = body.strip().splitlines()
+    head = "\n".join(lines[:PREVIEW_LINES])
+    if len(lines) > PREVIEW_LINES:
+        head += f"\n… {len(lines) - PREVIEW_LINES} more lines"
+    return head
 
 
 def _handle_command(line: str, session: Session, config: Config, terminal: Terminal = HEADLESS) -> bool:
@@ -487,6 +588,10 @@ def _handle_command(line: str, session: Session, config: Config, terminal: Termi
                 terminal.write("")
         else:
             _offer_memories(session, config, terminal)
+        return False
+
+    if command == "/read":
+        read_into(session, argument, terminal)
         return False
 
     if command == "/agent":

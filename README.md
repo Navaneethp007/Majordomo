@@ -160,6 +160,7 @@ Inside the session:
 |---|---|
 | `/context` | what memory and activity are loaded, and how large it has grown |
 | `/clear` | start fresh, keeping the loaded context |
+| `/read PATH` | hand it a document — text, PDF or Word — to talk about |
 | `/remember` | propose what from this conversation is worth keeping |
 | `/agent TASK` | put the agent to work without leaving the conversation |
 | `/build NAME` | scaffold a repo from this conversation |
@@ -168,6 +169,24 @@ Inside the session:
 
 These are cheap to rename precisely because nobody scripts against them — which is the
 other half of why there is one door.
+
+`/read` is the one that reaches the disk from a plain conversation. Chat has no tools by
+design, and this is not a hole in that: the agent is confined to a project directory
+because a *model* chooses the paths, and here you typed one. What does still apply is the
+credential denylist — `.env`, `.ssh/`, `*.pem` are refused, because a read means the
+contents reach a model provider — along with the same 8,000-character cap the agent's
+reads get, so a long document cannot quietly swallow the conversation.
+
+The document's text is also **fenced**, and this is the part worth knowing. The agent's
+file reads come back as `role: "tool"`, a channel the model knows is machine output;
+`/read` has no tool call to attach to, so its text can only arrive as a user turn — the
+highest-trust channel there is. But "hand it a document" usually means a document somebody
+*sent* you, so its author is generally not you. The text is therefore wrapped in
+`<<<DOCUMENT name>>>` … `<<<END DOCUMENT>>>`, the system prompt says that region is
+material to discuss and never instructions to follow, and three markers are defanged
+inside it: the closing fence (a fence a document can close is not a fence), `NEEDS_AGENT:`
+(or a document picks the task you get asked to approve) and `REMEMBER:` (or it writes
+itself a memory that replays forever).
 
 ## Commands
 
@@ -261,7 +280,7 @@ what was stored differing from what you were shown.
 pytest
 ```
 
-1080 tests. The suite covers the safety properties directly — path confinement, the
+1106 tests. The suite covers the safety properties directly — path confinement, the
 confirmation gate, what compaction keeps — because those are the parts where being wrong
 is expensive rather than merely annoying.
 

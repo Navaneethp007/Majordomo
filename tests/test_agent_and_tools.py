@@ -725,3 +725,28 @@ def test_the_newest_useful_result_wins(project):
 
 def test_nothing_to_salvage_from_an_empty_run():
     assert agent.last_result(agent.Outcome()) == ""
+
+
+# ---------------------------------------------------------------------------
+# was_truncated — the fact, not an inference from length
+# ---------------------------------------------------------------------------
+
+def test_was_truncated_is_exact_at_the_boundary():
+    """`MAX_RESULT_CHARS <= len(body)` was arithmetic about a side effect, and
+    claimed a truncation that never happened for a body of exactly the limit."""
+    exact = "x" * tools.MAX_RESULT_CHARS
+    assert tools._truncate(exact) == exact
+    assert tools.was_truncated(exact) is False
+
+    over = "x" * (tools.MAX_RESULT_CHARS + 1)
+    assert tools.was_truncated(tools._truncate(over)) is True
+
+    assert tools.was_truncated("short") is False
+
+
+def test_a_truncated_read_is_detectable_by_its_caller(tmp_path):
+    big = tmp_path / "big.txt"
+    big.write_text("y" * (tools.MAX_RESULT_CHARS * 2), encoding="utf-8")
+
+    body = tools.read_file(tmp_path, "big.txt")
+    assert tools.was_truncated(body)
