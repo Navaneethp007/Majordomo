@@ -36,6 +36,266 @@ def test_missing_key_raises_and_names_the_env_var(monkeypatch):
     assert "OPENROUTER_API_KEY" in str(exc.value)
 
 
+# ---------------------------------------------------------------------------
+# Keyless endpoints
+#
+# `base_url` was always configurable, so the docs offered an Ollama config —
+# but every request demanded a key first, so that config could never have run.
+# An empty `api_key_env` is the spelling for "this endpoint wants no key".
+# ---------------------------------------------------------------------------
+
+KEYLESS = replace(BRAIN, api_key_env="", base_url="http://localhost:11434/v1")
+
+
+def test_an_empty_key_env_sends_no_authorization_header(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    seen = {}
+
+    def capture(url, headers=None, **kwargs):
+        seen["url"] = url
+        seen["headers"] = headers
+        return response({"choices": [{"message": {"content": "local"}}]})
+
+    monkeypatch.setattr(llm, "_post", capture)
+
+    assert llm.complete(MSG, KEYLESS, "llama3.2") == "local"
+    # Absent, not empty: a server that rejects `Bearer ` with nothing after it
+    # is worse than one that never saw the header.
+    assert "Authorization" not in seen["headers"]
+    assert seen["url"].startswith("http://localhost:11434/v1")
+
+
+def test_mj_config_reports_a_keyless_setup_as_needing_no_key(monkeypatch, capsys):
+    """Not "NOT SET": there is no variable, and nothing is missing."""
+    from majordomo import cli, paths
+    import yaml
+
+    paths.ensure_home()
+    paths.default_config_path().write_text(
+        yaml.safe_dump({"brain": {"api_key_env": "", "provider": "ollama"}}),
+        encoding="utf-8",
+    )
+
+    cli.main(["config"])
+    out = capsys.readouterr().out
+
+    assert "none needed" in out
+    assert "NOT SET" not in out
+
+
+def test_a_named_but_unset_variable_still_raises(monkeypatch):
+    """Naming a variable is a promise that it holds something."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(MissingApiKey):
+        llm.complete(MSG, BRAIN, "some/model")
+
+
+# ---------------------------------------------------------------------------
+# Naming the knob on a permanent failure
+#
+# The failure this project is most likely to hand someone is a shipped default
+# going stale: the defaults are OpenRouter *free* ids, and free ids appear and
+# vanish. That arrived as a wall of JSON naming a model id, with nothing to say
+# the id is a config value, which role used it, or that `mj config` exists — so
+# the most probable failure read like a bug in the tool.
+# ---------------------------------------------------------------------------
+
+def _responder(status, body, monkeypatch):
+    def post(url, headers=None, **_kwargs):
+        r = mock.MagicMock()
+        r.is_success = 200 <= status < 300
+        r.status_code = status
+        r.text = body
+        r.headers = {}
+        import json
+
+        r.json.return_value = json.loads(body)
+        return r
+
+    monkeypatch.setattr(llm, "_post", post)
+
+
+def test_a_vanished_model_names_the_role_and_the_file(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    _responder(404, '{"error":{"message":"No endpoints found","code":404}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, BRAIN, BRAIN.chat_model)
+
+    text = str(exc.value)
+    assert "brain.chat_model" in text
+    assert "mj ask, mj chat" in text   # the role's purpose, not just its name
+    assert "mj config" in text         # how to find the file and the other roles
+
+
+def test_every_role_using_the_model_is_named(monkeypatch):
+    """Pointing all six roles at one model is the normal local setup, and each
+    one is a separate line to change."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    brain = replace(
+        BRAIN, worker_model="one/model", chat_model="one/model", fallback_model=""
+    )
+    _responder(404, '{"error":{"message":"gone","code":404}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, brain, "one/model")
+
+    text = str(exc.value)
+    assert "brain.worker_model" in text
+    assert "brain.chat_model" in text
+
+
+def test_a_transient_failure_gets_no_config_advice(monkeypatch):
+    """A busy provider has nothing to do with your models, and telling someone to
+    edit them because a pool was briefly full is worse than saying nothing."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    _responder(503, '{"error":{"message":"busy"}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, NO_FALLBACK, "some/model")
+
+    assert "mj config" not in str(exc.value)
+    assert "brain." not in str(exc.value)
+
+
+def test_a_transport_failure_gets_no_config_advice(monkeypatch):
+    """No status at all — a DNS or TLS failure says nothing about configuration."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+
+    def boom(*_args, **_kwargs):
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(llm, "_post", boom)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, NO_FALLBACK, "some/model")
+
+    assert "mj config" not in str(exc.value)
+
+
+def test_a_rejected_key_points_at_the_env_var_not_the_models(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-wrong")
+    _responder(401, '{"error":{"message":"No auth credentials","code":401}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, NO_FALLBACK, "some/model")
+
+    text = str(exc.value)
+    assert "OPENROUTER_API_KEY" in text
+    assert ".env" in text
+    assert "brain.chat_model" not in text  # not a model problem
+
+
+def test_a_401_on_a_keyless_config_does_not_name_a_blank_variable(monkeypatch):
+    """A keyless 401 is a disagreement, not a missing key.
+
+    The config says this endpoint wants no auth and the server says otherwise, so
+    "check  in ~/.majordomo/.env" — with nothing where the variable should be —
+    was both ungrammatical and the wrong advice. Reachable via LM Studio with auth
+    turned on, or a hosted base_url left behind when api_key_env was blanked.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    brain = replace(BRAIN, api_key_env="", fallback_model="")
+    _responder(401, '{"error":{"message":"No auth credentials","code":401}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, brain, brain.chat_model)
+
+    text = str(exc.value)
+    assert "Check  in" not in text            # the blank
+    assert "brain.api_key_env` is empty" in text
+    assert "base_url" in text                  # the other thing it could be
+
+
+def test_the_advice_names_no_config_path(monkeypatch):
+    """`brain` does not carry where it was loaded from, so printing the default
+    location told anyone using `--config other.yml` to edit the wrong file."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    _responder(404, '{"error":{"message":"gone","code":404}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, replace(BRAIN, fallback_model=""), BRAIN.chat_model)
+
+    text = str(exc.value)
+    assert "config.yml" not in text
+    assert "mj config" in text  # which does know, and prints it
+
+
+def test_a_permanent_error_wearing_a_200_still_gets_advice(monkeypatch):
+    """A failure in a 200's body is still that failure — it must classify by the
+    envelope's own code, not the status it arrived wearing."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    _responder(200, '{"error":{"message":"No endpoints found","code":404}}', monkeypatch)
+
+    with pytest.raises(LLMError) as exc:
+        llm.complete(MSG, replace(BRAIN, fallback_model=""), BRAIN.chat_model)
+
+    assert "brain.chat_model" in str(exc.value)
+
+
+def test_the_role_table_is_the_one_in_config():
+    """Read backwards from `brain`, so there is no second copy to drift."""
+    from majordomo.config import MODEL_ROLES
+
+    fields = {field for _label, field, _purpose in MODEL_ROLES}
+    assert fields <= set(BRAIN.__dataclass_fields__)
+
+    # The shipped defaults point `fuser` and `fallback` at the same id, so both
+    # match — which is the behaviour wanted, since both are lines to edit.
+    assert [f for _l, f, _p in llm._roles_using(BRAIN, BRAIN.fuser_model)] == [
+        "fuser_model",
+        "fallback_model",
+    ]
+    assert llm._roles_using(BRAIN, "nothing/points/here") == []
+
+    # An unset role must not match every model that happens to be "".
+    blank = replace(BRAIN, agent_model="", fallback_model="")
+    assert llm._roles_using(blank, "") == []
+
+
+def test_a_daily_cap_on_the_fallback_keeps_its_own_sentence(monkeypatch):
+    """It was wrapped in "X failed; fallback also failed", which buried the one
+    message that says when it comes back."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    calls = []
+
+    def post(url, headers=None, json=None, **_kwargs):
+        calls.append(json["model"])
+        r = mock.MagicMock()
+        r.headers = {}
+        if len(calls) == 1:
+            r.is_success = False
+            r.status_code = 404
+            r.text = '{"error":{"message":"gone","code":404}}'
+            r.json.return_value = {"error": {"message": "gone", "code": 404}}
+            return r
+        r.is_success = False
+        r.status_code = 429
+        r.text = '{"error":{"message":"free-models-per-day limit reached"}}'
+        r.json.return_value = {"error": {"message": "free-models-per-day"}}
+        return r
+
+    monkeypatch.setattr(llm, "_post", post)
+
+    with pytest.raises(llm.QuotaExhausted):
+        llm.complete(MSG, BRAIN, BRAIN.chat_model)
+
+
+def test_a_keyless_config_ignores_a_key_that_happens_to_be_set(monkeypatch):
+    """`api_key_env: ""` means no key, not "find one somewhere"."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
+    seen = {}
+
+    def capture(url, headers=None, **kwargs):
+        seen["headers"] = headers
+        return response({"choices": [{"message": {"content": "local"}}]})
+
+    monkeypatch.setattr(llm, "_post", capture)
+
+    llm.complete(MSG, KEYLESS, "llama3.2")
+    assert "Authorization" not in seen["headers"]
+
+
 def test_happy_path_returns_content(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")
     payload = {"choices": [{"message": {"content": "the answer"}}]}

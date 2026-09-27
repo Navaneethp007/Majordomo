@@ -177,7 +177,7 @@ def test_a_missing_extra_names_the_extra(tmp_path):
     with mock.patch.dict("sys.modules", {"pypdf": None}):
         result = tools.read_file(tmp_path, path="report.pdf")
 
-    assert "majordomo[documents]" in result
+    assert "[documents]" in result
 
 
 def test_a_missing_docx_extra_names_it_too(tmp_path):
@@ -187,7 +187,7 @@ def test_a_missing_docx_extra_names_it_too(tmp_path):
     with mock.patch.dict("sys.modules", {"docx": None}):
         result = tools.read_file(tmp_path, path="notes.docx")
 
-    assert "majordomo[documents]" in result
+    assert "[documents]" in result
 
 
 def test_the_three_failures_are_told_apart():

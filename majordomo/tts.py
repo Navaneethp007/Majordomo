@@ -14,6 +14,8 @@ Majordomo's sectioned config to grow a Voicelog-shaped shim.
 """
 from __future__ import annotations
 
+from majordomo import install_hint
+
 import os
 import platform
 import re
@@ -236,7 +238,7 @@ def _synth_nvidia(chunks: list[str], api_key: str, cfg: VoiceConfig) -> tuple[by
         riva_client, AudioEncoding = _import_riva()
     except ImportError as exc:
         raise TTSError(
-            "NVIDIA Riva TTS not installed — run: pip install majordomo[nvidia]"
+            f"NVIDIA Riva TTS not installed — run: {install_hint('nvidia')}"
         ) from exc
 
     import grpc  # available whenever riva.client imported

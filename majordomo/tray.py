@@ -4,11 +4,13 @@ Deliberately thin. It owns no logic of its own: it starts the panel, opens a
 browser at it, and calls the same ``brief.run`` the CLI does. Everything
 interesting lives one layer down and is testable without a GUI.
 
-``pystray`` and ``Pillow`` are an optional extra, so ``pip install majordomo``
-gets you a working CLI without dragging in a GUI toolkit. The import failure is
+``pystray`` and ``Pillow`` are an optional extra, so a plain install gets you a
+working CLI without dragging in a GUI toolkit. The import failure is
 turned into an instruction rather than a traceback.
 """
 from __future__ import annotations
+
+from majordomo import install_hint
 
 import threading
 import webbrowser
@@ -27,7 +29,7 @@ def _load_pystray():
         from PIL import Image, ImageDraw
     except ImportError as exc:
         raise TrayUnavailable(
-            "the tray needs extra packages — run: pip install majordomo[tray]"
+            f"the tray needs extra packages — run: {install_hint('tray')}"
         ) from exc
     return pystray, Image, ImageDraw
 

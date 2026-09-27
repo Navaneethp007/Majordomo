@@ -78,12 +78,18 @@ brain:
 # Anything speaking the OpenAI /chat/completions shape works. Replace the three
 # lines above with one of these.
 #
+# An EMPTY api_key_env means "this endpoint needs no key": no Authorization
+# header is sent at all. That is the only correct spelling for a local server.
+# Naming a variable is a promise that it holds something, so a name that is
+# unset is still an error — which is what you want for a hosted provider, and
+# exactly wrong for one running on your own machine.
+#
 # Ollama, entirely local — no key, no network, no per-token cost. Slower on a
 # CPU-only machine, and a small model will struggle with the fuser's rules.
 #   brain:
 #     provider: ollama
 #     base_url: http://localhost:11434/v1
-#     api_key_env: OLLAMA_API_KEY      # unused; Ollama ignores auth
+#     api_key_env: ""                  # no key; Ollama wants no auth
 #     worker_model: llama3.2
 #     fuser_model: qwen2.5:14b
 #     reducer_model: qwen2.5:14b
@@ -91,8 +97,9 @@ brain:
 #     agent_model: qwen2.5-coder:14b
 #     fallback_model: ""               # nothing to fall back to
 #
-# LM Studio, also local:
+# LM Studio, also local — same empty key:
 #   base_url: http://localhost:1234/v1
+#   api_key_env: ""
 #
 # OpenAI directly:
 #   brain:
@@ -121,8 +128,8 @@ brain:
 # Optional in both directions. Set enabled: false and Majordomo prints instead
 # of speaking, and `/voice` disappears from the chat prompt.
 #
-# Needs extras:  pip install -e .[nvidia]   speech out, and in
-#                pip install -e .[voice]    microphone capture
+# Needs extras:  uv tool install --force "mj[nvidia]"   speech out, and in
+#                uv tool install --force "mj[voice]"    microphone capture
 voice:
   enabled: true
   provider: nvidia

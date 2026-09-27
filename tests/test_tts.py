@@ -266,7 +266,7 @@ def test_nvidia_missing_package_names_the_extra(monkeypatch):
 
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello.", NVIDIA_CFG)
-    assert "majordomo[nvidia]" in str(exc.value)
+    assert "[nvidia]" in str(exc.value)
 
 
 def test_nvidia_timeout_cancels_the_call(monkeypatch):

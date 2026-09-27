@@ -29,6 +29,8 @@ room, and a recorder that never stops is worse than one that stops too early.
 """
 from __future__ import annotations
 
+from majordomo import install_hint
+
 import os
 
 from majordomo.config import VoiceConfig
@@ -146,7 +148,7 @@ def _open_stream(cfg: VoiceConfig):
         sounddevice = _import_sounddevice()
     except ImportError as exc:
         raise MicrophoneUnavailable(
-            "voice input needs an extra package — run: pip install majordomo[voice]"
+            f"voice input needs an extra package — run: {install_hint('voice')}"
         ) from exc
 
     rate = cfg.asr_sample_rate
@@ -226,7 +228,7 @@ def check_microphone() -> None:
         sounddevice = _import_sounddevice()
     except ImportError as exc:
         raise MicrophoneUnavailable(
-            "voice input needs an extra package — run: pip install majordomo[voice]"
+            f"voice input needs an extra package — run: {install_hint('voice')}"
         ) from exc
 
     try:
@@ -310,7 +312,7 @@ def _transcribe_nvidia(pcm: bytes, rate: int, api_key: str, cfg: VoiceConfig) ->
         from riva.client.proto.riva_audio_pb2 import AudioEncoding
     except ImportError as exc:
         raise ASRError(
-            "NVIDIA Riva ASR not installed — run: pip install majordomo[nvidia]"
+            f"NVIDIA Riva ASR not installed — run: {install_hint('nvidia')}"
         ) from exc
 
     if not cfg.asr_function_id:

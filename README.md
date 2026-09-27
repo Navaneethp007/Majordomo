@@ -10,27 +10,59 @@ It is **not** a notification relay, and it is **not** a daemon. Your apps alread
 "PR merged" / "new ticket". Majordomo does the opposite: it digests those streams and
 surfaces only what needs a decision, when you ask it to.
 
-```
-mj chat                      # a conversation, with your memory and activity loaded
-mj ask "what did I ship?"    # one question, same context, no session
-mj do "add tests for X"      # the agent works in this directory, asking before it writes
-mj brief                     # one spoken summary of what actually needs you
-```
-
-Status: **in development**, used daily by its author. Windows first; nothing is
-deliberately platform-locked but nothing else is tested.
-
-## Install
+## Install, and the only command you need
 
 ```
-pip install -e .[dev]
+uv tool install mj
+mj
 ```
 
-Python 3.10+. Configuration is entirely optional — every setting has a default:
+That is the whole thing. The first `mj` configures itself — a model to talk to, and
+optionally the Claude Code hooks and a spoken briefing on wake — and then drops you
+straight into the conversation. Every `mj` after that just opens it, with a line telling
+you what it already knows and where you left off.
+
+```
+$ mj
+Majordomo. /help for commands, `mj help` for the CLI, /exit to leave.
+(6 memories indexed, 2 loaded in full, activity through 2026-09-26)
+Last time: 20260926-1431   14 turns  why is the fuser promoting context items
+
+you › ▏
+```
+
+**Why one command.** A tool has one job and a front door made of flags. An assistant is a
+place you go, and its front door is itself. Sixteen subcommands meant knowing what you
+wanted before you arrived — and meant sixteen names that could never change. One door is
+one promise.
+
+`uv tool` (or `pipx`) rather than plain `pip`, because an app installed into whichever
+virtualenv happened to be active disappears when you deactivate it. Plain `pip` still
+works and is worth using if you want to import from this — `agent.run`, `brief.run`,
+`context.build` are real library surface, and the import package is still `majordomo`:
+
+```
+pip install mj
+from majordomo import agent, brief, context
+```
+
+Python 3.10+. Windows first; nothing is deliberately platform-locked but nothing else is
+tested.
+
+### If you would rather not paste an API key
+
+Setup offers a local model instead. If Ollama is running, everything can point at it: no
+key, no network, nothing leaving the machine. Slower, and a small model struggles with the
+briefing's rules, but it works end to end. See `api_key_env: ""` in the example config.
+
+### Configuration is optional
+
+Every setting has a default, so there is nothing you must write:
 
 ```
 mj config           what is in force right now, and which model does what
 mj config --init    write an annotated ~/.majordomo/config.yml to edit
+mj setup            go through first-run setup again
 ```
 
 API keys go in `~/.majordomo/.env`. The config file names environment *variables*, never
@@ -46,11 +78,16 @@ machine. Point `brain.base_url` and `brain.api_key_env` at it:
 brain:
   provider: ollama
   base_url: http://localhost:11434/v1
-  api_key_env: OLLAMA_API_KEY     # unused; Ollama ignores auth
+  api_key_env: ""                 # empty means "needs no key" — see below
   chat_model: qwen2.5:14b
   agent_model: qwen2.5-coder:14b
   fallback_model: ""              # nothing to fall back to
 ```
+
+An **empty** `api_key_env` sends no `Authorization` header at all, which is the only
+correct spelling for a local server. Naming a variable is a promise that it holds
+something, so a name that is unset is still an error — right for a hosted provider, and
+exactly wrong for one on your own machine.
 
 Anthropic's own API is not OpenAI-shaped, so reach Claude models through OpenRouter
 (`anthropic/claude-sonnet-4.5`) rather than pointing `base_url` at it.
@@ -72,28 +109,52 @@ and a list of things that don't, and must say "nothing needs you" when the first
 empty. A model that promotes something from the second list makes the whole tool
 untrustworthy — that is the single check to run against any candidate.
 
+**The shipped defaults will go stale.** They are OpenRouter *free* model ids, and free ids
+appear and vanish. When one does, the failure says which role was pointing at it and which
+line to edit rather than leaving you with a 404:
+
+```
+No endpoints found for dots-studio/dots-3-note-preview:free
+  … was rejected and will keep being rejected. Free model ids come and go, so
+  this is usually a shipped default that has aged out rather than anything you did.
+  Set by:
+    brain.worker_model   compress each source
+    brain.chat_model     mj ask, mj chat
+  Edit ~/.majordomo/config.yml — `mj config` lists all six roles.
+```
+
+Setup does not ask you to pick models. Choosing between model ids is not a question
+anyone can answer in their first minute, and it is the same "know what you want before you
+arrive" problem the single front door removes.
+
 [majordomo/config.example.yml](majordomo/config.example.yml) explains every setting.
 
 Optional extras, none required for text:
 
 | Extra | For |
 |---|---|
-| `.[nvidia]` | speech, in and out, via NVIDIA Riva (gRPC, hence separate) |
-| `.[voice]` | microphone capture — the one dependency speech *input* costs |
-| `.[tray]` | the resident tray icon |
+| `mj[nvidia]` | speech, in and out, via NVIDIA Riva (gRPC, hence separate) |
+| `mj[voice]` | microphone capture — the one dependency speech *input* costs |
+| `mj[documents]` | text out of PDFs and Word files |
+| `mj[tray]` | the resident tray icon |
 
-## Commands
+Adding one later means reinstalling with it named, e.g.
+`uv tool install --force "mj[voice]"`. Every "not installed" message tells you the line.
 
-### Talking to it
+## The door
 
 ```
-mj chat                   an interactive session with your context loaded
-  --resume [ID]           continue the most recent conversation, or one by id
-  --list                  list saved conversations
-mj ask <question>         one question, answered with the same context
+mj                        the conversation. This is the product.
+mj help                   list these commands
 ```
 
-Inside `mj chat`:
+Piped input is answered once and exits, so the door is scriptable too:
+
+```
+$ echo "what did I ship this week?" | mj
+```
+
+Inside the session:
 
 | | |
 |---|---|
@@ -103,6 +164,29 @@ Inside `mj chat`:
 | `/agent TASK` | put the agent to work without leaving the conversation |
 | `/build NAME` | scaffold a repo from this conversation |
 | `/voice` | speak your next message instead of typing it |
+| `/help` | the list |
+
+These are cheap to rename precisely because nobody scripts against them — which is the
+other half of why there is one door.
+
+## Commands
+
+The stable set. Scripts and the scheduled trigger depend on these, so they are the ones
+that will not move:
+
+```
+mj brief                  fetch, fuse, print and speak what needs you
+mj ask <question>         one question, answered with your context loaded
+mj do <task>              the agent works in the current directory
+mj chat                   the session, with --resume and --list
+mj config                 what is configured, and which model does what
+mj setup                  first-run setup, again
+```
+
+Everything else — `sessions`, `resume`, `review`, `start`, `mic`, `activity`, `remember`,
+`install-hooks`, `install-trigger`, `tray` — still works exactly as before and is
+documented below, but is deliberately absent from `mj --help`. Treat it as internal: it
+may be renamed or moved inside the session without notice.
 
 ### Doing things
 
@@ -137,6 +221,8 @@ mj resume <id>            jump back into a session, on the right surface
 ```
 
 ### Wiring it in
+
+Setup offers the two that touch your machine. These are the manual equivalents:
 
 ```
 mj config                 what is configured, and which model does what
@@ -175,7 +261,7 @@ what was stored differing from what you were shown.
 pytest
 ```
 
-976 tests. The suite covers the safety properties directly — path confinement, the
+1074 tests. The suite covers the safety properties directly — path confinement, the
 confirmation gate, what compaction keeps — because those are the parts where being wrong
 is expensive rather than merely annoying.
 

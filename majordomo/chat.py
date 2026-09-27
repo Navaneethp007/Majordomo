@@ -205,10 +205,19 @@ def run(
 
     session = new_session(config, resume=resume, transcript=transcript)
 
-    terminal.write("Majordomo. /help for commands, /exit to leave.")
+    terminal.write("Majordomo. /help for commands, `mj help` for the CLI, /exit to leave.")
     terminal.write(f"({session.context_summary})")
     if session.turns:
         terminal.write(f"Resumed {len(session.turns)} turns from {session.path.name}.")
+    else:
+        # Not a resume — but say the last conversation is there. Reading it costs
+        # one file, which is why this can go on the banner at all; actually
+        # resuming it would carry its tokens into every turn and could fire a
+        # reducer call before the first prompt, so that stays a decision you make.
+        previous = latest_transcript()
+        if previous is not None:
+            terminal.write(f"Last time: {describe_session(previous)}")
+            terminal.write("(`mj chat --resume` picks it up)")
     terminal.write("")
 
     trigger = config.voice.listen_key if config.voice.enabled else ""
@@ -387,41 +396,26 @@ def _offer_agent(session, config, reply, asked_for, terminal: Terminal = HEADLES
     friction for its own sake. So: it asks, and a `y` runs exactly what
     ``/agent`` would.
 
-    Two ways in. The model is told to emit ``NEEDS_AGENT: <task>`` when a
-    question genuinely needs the disk — a structural signal, parsed in Python,
-    the same discipline as ``needs_you``. And when it ignores that and writes
-    out a tool call instead, the markup is dropped rather than printed: raw
-    ``<function_call>`` text reads as though something ran.
+    ``prompts.classify_reply`` decides *whether* this is a hand-off and what the
+    task is; this function only decides what to do about it. The two used to be
+    one blob here and another in ``cli.cmd_ask``, and they drifted twice — see
+    that function's note. What genuinely differs is the answer to "then what":
+    here it asks permission, because there is a conversation to ask in.
     """
     from majordomo import prompts
     from majordomo import render as render_mod
 
-    task = prompts.needs_agent(reply)
-    leaked = task is None and prompts.looks_like_a_tool_call(reply)
-    if task is None and not leaked:
+    handoff = prompts.classify_reply(reply, asked_for)
+    if handoff is None:
         return False
 
-    # An empty task means the marker arrived carrying nothing. It is still a
-    # hand-off — the alternative is printing the protocol token — so fall back
-    # to what was actually asked for.
-    if not task:
-        task = asked_for
-
     shown: list[str] = []
-
-    # Whichever branch we are on, keep whatever prose came with it. A model that
-    # wrote three good paragraphs and one stray marker should lose the marker,
-    # not the paragraphs — and declining the offer must not cost you the answer.
-    # The leaked branch always did this; the marker branch did not, and the two
-    # doing the same job differently is how one of them stays wrong.
-    kept = (
-        prompts.strip_tool_call(reply) if leaked else prompts.strip_needs_agent(reply)
-    )
-    if kept:
-        shown.append(render_mod.render(kept))
-    if leaked:
+    if handoff.kept:
+        shown.append(render_mod.render(handoff.kept))
+    if handoff.leaked:
         shown.append(prompts.NO_TOOLS_HERE)
 
+    task = handoff.task
     shown.append("That needs the agent, which can read and change files here.")
     shown.append(f"  {task}")
 

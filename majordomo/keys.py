@@ -21,12 +21,14 @@ No kill-ring, no reverse search, no word motions, no persistence. History lives
 for the process only — the chat transcript already records what was said, and a
 second store on disk would drift from it.
 
-Redraw assumes the line fits the terminal width. Past that the console wraps,
-``\\r`` returns to the start of the *visual* row rather than the logical line,
-and editing a wrapped line leaves debris. Tracking wrap means tracking terminal
-width and resize events, which is a real cost for a prompt where a long message
-is usually pasted rather than edited — so this is a known limit, not an
-oversight. Enter still submits the whole line correctly either way.
+Wrapping *is* handled, after a spell when it was not. The note here used to
+call it an acceptable limit on the grounds that "a long message is usually
+pasted rather than edited" — which was simply wrong: a typed prompt runs past
+eighty columns constantly, and every keystroke after that repainted the prompt
+and the first row's worth of text underneath the line. See ``_redraw``.
+
+Terminal *resizing* mid-line is still not handled. The width is read fresh on
+each keystroke, so it corrects itself on the next one.
 
 ── ON CTRL+M ────────────────────────────────────────────────────────────────
 Ctrl+M is byte 13 — precisely what Enter sends. A terminal cannot distinguish
@@ -36,6 +38,7 @@ reason.
 """
 from __future__ import annotations
 
+import shutil
 import sys
 
 #: What ``read_line`` returns instead of text when the trigger key was pressed.
@@ -116,22 +119,104 @@ def raw_reads_available(stream=None) -> bool:
     return True
 
 
-def _redraw(prompt: str, text: str, cursor: int, previous_len: int) -> None:
-    """Repaint the line and put the cursor where it belongs.
+def _ansi_available(stream=None) -> bool:
+    """Will the cursor codes render, or land as visible garbage?
 
-    Carriage return to the left margin, write it all again, then blank whatever
-    the previous line left behind — without that, deleting a character leaves
-    its ghost at the end. Then walk the cursor back into place.
+    Also the thing that *enables* them: on Windows, virtual-terminal processing
+    is off per console until something calls ``SetConsoleMode``, which
+    ``render.supports_ansi`` does. Nothing had — ``read_line`` runs before the
+    first reply is rendered, so the very first line you typed was the one at
+    risk of showing raw escapes.
     """
-    out = sys.stdout
-    out.write("\r" + prompt + text)
-    trailing = previous_len - len(text)
-    if trailing > 0:
-        out.write(" " * trailing)
-        out.write("\b" * trailing)
-    back = len(text) - cursor
-    if back > 0:
-        out.write("\b" * back)
+    from majordomo import render
+
+    return render.supports_ansi(stream)
+
+
+def _terminal_width(stream=None) -> int:
+    """How many columns the line has before it wraps. Never zero."""
+    try:
+        return max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    except (OSError, ValueError):
+        return 80
+
+
+def _redraw(prompt: str, text: str, cursor: int, row: int, stream=None) -> int:
+    """Repaint the whole line and park the cursor. Returns its new row.
+
+    ``\\r`` returns to the start of the *visual* row, not of the line. That is
+    fine until the line wraps, and then it is the bug you see: the cursor is on
+    the second row, so every keystroke repainted the prompt and the first row's
+    worth of text *underneath* the line, over and over. The old note here called
+    that an acceptable limit because "a long message is usually pasted rather
+    than edited" — which was wrong. A typed prompt runs past eighty columns all
+    the time.
+
+    So the row is tracked. Go up to the line's first row, clear everything from
+    there down, write it again, and walk the cursor back to where it belongs.
+    ``row`` is where the cursor was left last time; the return value is where it
+    is now, and the caller carries it between keystrokes.
+    """
+    out = stream if stream is not None else sys.stdout
+
+    if not _ansi_available(out):
+        # No cursor control: repaint one row and pad the tail, which is what
+        # this did before wrapping was handled. Wrong past the margin, but
+        # wrong quietly rather than spraying escape codes at you.
+        out.write("\r" + prompt + text + " ")
+        back = len(text) - cursor
+        if back > 0:
+            out.write("\b" * (back + 1))
+        out.flush()
+        return 0
+
+    width = _terminal_width(out)
+
+    if row:
+        out.write(f"\x1b[{row}A")
+    # To the left margin, then erase from here to the end of the screen. That
+    # is what removes a row the line no longer needs — the old space-padding
+    # trick only ever cleared the tail of one row.
+    out.write("\r\x1b[0J")
+    out.write(prompt + text)
+
+    end = len(prompt) + len(text)
+    if end and end % width == 0:
+        # The text ends exactly at the margin. Terminals differ on whether the
+        # cursor has wrapped yet; writing one space forces the question, so the
+        # arithmetic below is true either way.
+        out.write(" ")
+
+    end_row = end // width
+    target_row, target_column = divmod(len(prompt) + cursor, width)
+
+    if end_row > target_row:
+        out.write(f"\x1b[{end_row - target_row}A")
+    out.write("\r")
+    if target_column:
+        out.write(f"\x1b[{target_column}C")
+
+    out.flush()
+    return target_row
+
+
+def _finish_line(prompt: str, text: str, row: int, stream=None) -> None:
+    """Move past the end of a possibly-wrapped line and start a new one.
+
+    A bare newline from wherever the cursor happens to sit leaves the tail of a
+    wrapped line above it and the next prompt written over the middle of it.
+    """
+    out = stream if stream is not None else sys.stdout
+    if not _ansi_available(out):
+        out.write("\n")
+        out.flush()
+        return
+
+    width = _terminal_width(out)
+    end_row = (len(prompt) + len(text)) // width
+    if end_row > row:
+        out.write(f"\x1b[{end_row - row}B")
+    out.write("\n")
     out.flush()
 
 
@@ -153,7 +238,7 @@ def read_line(prompt: str, trigger: str = "") -> str | object:
 
     text = ""
     cursor = 0
-    painted = 0
+    row = 0
     # Where Up has walked to. len(_history) means "still on the new line".
     index = len(_history)
     # The line in progress, kept while browsing so Down returns you to it.
@@ -194,17 +279,14 @@ def read_line(prompt: str, trigger: str = "") -> str | object:
                 # fine, and far better than letting it reach the line.
                 continue
 
-            _redraw(prompt, text, cursor, painted)
-            painted = len(text)
+            row = _redraw(prompt, text, cursor, row)
             continue
 
         if trigger and char == trigger:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _finish_line(prompt, text, row)
             return TRIGGERED
         if char == _CTRL_C:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _finish_line(prompt, text, row)
             raise KeyboardInterrupt
         if char in (_CTRL_Z, _CTRL_D):
             if text:
@@ -212,26 +294,22 @@ def read_line(prompt: str, trigger: str = "") -> str | object:
                 # an empty line ends the session, so a stray Ctrl+D mid-message
                 # cannot close the conversation.
                 continue
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _finish_line(prompt, text, row)
             raise EOFError
         if char in _ENTER:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _finish_line(prompt, text, row)
             remember(text)
             return text
         if char in _BACKSPACE:
             if cursor > 0:
                 text = text[: cursor - 1] + text[cursor:]
                 cursor -= 1
-                _redraw(prompt, text, cursor, painted)
-                painted = len(text)
+                row = _redraw(prompt, text, cursor, row)
             continue
         if char == _CTRL_U:
             text = ""
             cursor = 0
-            _redraw(prompt, text, cursor, painted)
-            painted = 0
+            row = _redraw(prompt, text, cursor, row)
             continue
         if char < " ":
             # Any other control character. Silently ignored rather than inserted
@@ -240,5 +318,4 @@ def read_line(prompt: str, trigger: str = "") -> str | object:
 
         text = text[:cursor] + char + text[cursor:]
         cursor += 1
-        _redraw(prompt, text, cursor, painted)
-        painted = len(text)
+        row = _redraw(prompt, text, cursor, row)

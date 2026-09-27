@@ -255,6 +255,25 @@ DEFAULTS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+#: The six model roles: label, the ``BrainConfig`` field, and what it is for.
+#:
+#: One table, because two places need it and they must not disagree. ``mj config``
+#: prints it, and ``llm`` reads it backwards — given a model id that a provider
+#: rejected permanently, it names which role was pointing at it and therefore
+#: which line of config to edit.
+#:
+#: The purposes are the strings a user reads, so they are phrased for that and
+#: are asserted on by the tests for ``mj config``.
+MODEL_ROLES: tuple[tuple[str, str, str], ...] = (
+    ("worker", "worker_model", "compress each source"),
+    ("fuser", "fuser_model", "write the spoken briefing"),
+    ("reducer", "reducer_model", "handle an oversized payload"),
+    ("chat", "chat_model", "mj ask, mj chat"),
+    ("agent", "agent_model", "mj do, /agent"),
+    ("fallback", "fallback_model", "when a role's model fails"),
+)
+
+
 @dataclass(frozen=True)
 class BrainConfig:
     provider: str
@@ -291,7 +310,7 @@ class VoiceConfig:
     asr_language: str = "en-US"
     asr_sample_rate: int = 16000
     listen_max_seconds: float = 30.0
-    listen_key: str = ""
+    listen_key: str = "\x0e"
     # 0 means "use the module default". Both depend on the speaker and the
     # room, which no default can know: how long a thinking pause runs before
     # it means "I have finished", and how quiet the room actually is.

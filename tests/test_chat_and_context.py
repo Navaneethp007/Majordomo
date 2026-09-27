@@ -786,6 +786,66 @@ def test_quitting_without_typing_writes_no_transcript(tmp_path, monkeypatch):
     assert chat.latest_transcript() == yesterday
 
 
+# ---------------------------------------------------------------------------
+# The banner
+#
+# Bare `mj` is now the front door, so this is the first thing anyone sees. It
+# has to say what is already known *without* spending anything: `context.build`
+# is disk-only, and naming the last conversation costs one file read. Actually
+# resuming it would carry its tokens into every turn and can fire a reducer call
+# before the first prompt, so the banner points rather than resumes.
+# ---------------------------------------------------------------------------
+
+def _banner(config, tmp_path, monkeypatch, session=None):
+    monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
+    lines = []
+    terminal = chat.Terminal(
+        write=lambda text="": lines.append(text), ask=lambda _q: "", confirm=lambda *_a: False
+    )
+    session = session or chat.Session(system="SYS", path=tmp_path / "new.jsonl")
+    with mock.patch.object(chat, "new_session", return_value=session):
+        with mock.patch("majordomo.keys.read_line", side_effect=EOFError):
+            chat.run(config, terminal=terminal)
+    return lines
+
+
+def test_the_banner_names_the_last_conversation(tmp_path, monkeypatch):
+    previous = tmp_path / "20260926-143100.jsonl"
+    previous.write_text(
+        '{"role": "user", "content": "why is the fuser promoting context", "at": ""}\n',
+        encoding="utf-8",
+    )
+
+    lines = _banner(CFG, tmp_path, monkeypatch)
+    text = "\n".join(lines)
+
+    assert "Last time:" in text
+    assert "why is the fuser promoting context" in text
+    # Points at it rather than loading it.
+    assert "--resume" in text
+
+
+def test_the_banner_says_nothing_about_history_on_a_first_run(tmp_path, monkeypatch):
+    lines = _banner(CFG, tmp_path, monkeypatch)
+    assert "Last time:" not in "\n".join(lines)
+
+
+def test_a_resumed_session_reports_turns_instead(tmp_path, monkeypatch):
+    """Not both: "resumed 14 turns" and "last time, 14 turns" is the same fact
+    said twice, and the second one reads like a different conversation."""
+    (tmp_path / "20260926-143100.jsonl").write_text(
+        '{"role": "user", "content": "earlier", "at": ""}\n', encoding="utf-8"
+    )
+    session = chat.Session(system="SYS", path=tmp_path / "20260926-143100.jsonl")
+    session.turns = [chat.Turn("user", "earlier")]
+
+    lines = _banner(CFG, tmp_path, monkeypatch, session=session)
+    text = "\n".join(lines)
+
+    assert "Resumed 1 turns" in text
+    assert "Last time:" not in text
+
+
 def test_a_conversation_is_still_saved_on_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(session_mod, "chats_dir", lambda: tmp_path)
     session = chat.Session(system="SYS", path=tmp_path / "c.jsonl")
@@ -968,6 +1028,71 @@ def test_a_bare_marker_is_still_a_hand_off():
 
 def test_an_ordinary_answer_costs_one_membership_test():
     assert prompts.needs_agent("a long ordinary reply\nover several lines") is None
+
+
+# ---------------------------------------------------------------------------
+# classify_reply — the one parse both callers share
+#
+# `chat._offer_agent` and `cli.cmd_ask` had a copy each, and the copies drifted
+# twice: first about whether a leaked tool call keeps its prose, then about
+# whether the marker branch does. Each time the branch that was right stayed
+# right and its sibling stayed wrong, because nothing made them one algorithm.
+# These tests pin the parse; what each caller does *next* still differs, and
+# differs on purpose.
+# ---------------------------------------------------------------------------
+
+def test_classify_returns_none_for_an_ordinary_answer():
+    assert prompts.classify_reply("Here is your answer.", "what is 2+2") is None
+
+
+def test_classify_finds_the_task_and_keeps_the_prose():
+    handoff = prompts.classify_reply(
+        "Happy to. That needs the disk.\n\nNEEDS_AGENT: review the api folder",
+        "look at api",
+    )
+    assert handoff is not None
+    assert handoff.task == "review the api folder"
+    assert handoff.leaked is False
+    # The paragraph survives. Declining the offer must not cost you the answer.
+    assert "Happy to." in handoff.kept
+    assert "NEEDS_AGENT" not in handoff.kept
+
+
+def test_classify_falls_back_to_what_was_asked_when_the_marker_is_bare():
+    handoff = prompts.classify_reply("NEEDS_AGENT:", "count the lines in a.py")
+    assert handoff is not None
+    assert handoff.task == "count the lines in a.py"
+
+
+def test_classify_treats_a_leaked_tool_call_as_the_same_request():
+    handoff = prompts.classify_reply(
+        'Let me look.\n<tool_call>{"name": "ls"}</tool_call>', "list the folder"
+    )
+    assert handoff is not None
+    assert handoff.leaked is True
+    assert handoff.task == "list the folder"
+    assert handoff.kept == "Let me look."
+
+
+def test_classify_never_leaves_the_marker_in_the_prose():
+    """The one outcome the marker exists to prevent is the marker on screen."""
+    for reply in (
+        "NEEDS_AGENT: do it",
+        "NEEDS_AGENT:",
+        "NEEDS_AGENT:\nread the file",
+        "prose first\n\nNEEDS_AGENT: then this",
+    ):
+        handoff = prompts.classify_reply(reply, "asked")
+        assert handoff is not None, reply
+        assert "NEEDS_AGENT" not in handoff.kept, reply
+        assert handoff.task, reply  # never empty, so nothing prints the token
+
+
+def test_classify_explaining_a_tool_call_is_not_a_hand_off():
+    """A fenced illustration is an example, not an emitted call. This project
+    invites the question, so throwing the answer away is the costly direction."""
+    answer = 'A tool call looks like this:\n\n```\n<tool_call>\n{"name":"ls"}\n```'
+    assert prompts.classify_reply(answer, "what does a tool call look like?") is None
 
 
 @pytest.mark.parametrize(

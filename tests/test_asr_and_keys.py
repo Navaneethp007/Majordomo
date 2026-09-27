@@ -1,6 +1,7 @@
 """Tests for speech input and the chat trigger key. No microphone, no network."""
 from __future__ import annotations
 
+import re
 import struct
 from unittest import mock
 
@@ -53,7 +54,7 @@ def fake_stream(blocks):
 
 def test_a_missing_capture_library_names_the_extra():
     with mock.patch.object(asr, "_import_sounddevice", side_effect=ImportError):
-        with pytest.raises(asr.MicrophoneUnavailable, match=r"majordomo\[voice\]"):
+        with pytest.raises(asr.MicrophoneUnavailable, match=r"\[voice\]"):
             asr.check_microphone()
 
 
@@ -621,7 +622,7 @@ def test_mj_mic_fails_cleanly_without_the_capture_extra():
     """It exists to diagnose voice, so it must not traceback on the machine
     most likely to need it: one without the extra installed."""
     with mock.patch.object(asr, "_import_sounddevice", side_effect=ImportError("no module")):
-        with pytest.raises(asr.MicrophoneUnavailable, match=r"majordomo\[voice\]"):
+        with pytest.raises(asr.MicrophoneUnavailable, match=r"\[voice\]"):
             asr.measure(CFG.voice, seconds=1.0, write=lambda *_: None)
 
 
@@ -673,3 +674,142 @@ def test_the_chunk_size_matches_the_sample_rate():
         _stream, chunk = asr._open_stream(VOICE)
 
     assert chunk == int(VOICE.asr_sample_rate * asr.CHUNK_MS / 1000)
+
+
+# ---------------------------------------------------------------------------
+# Lines that wrap
+# ---------------------------------------------------------------------------
+
+
+class Screen:
+    """A terminal small enough to wrap, that understands what `_redraw` emits.
+
+    Asserting on the raw escape sequence would test the implementation. What
+    matters is what ends up on screen, so this applies the codes and reports
+    the rows — which is how the repeating-prompt bug is visible at all.
+    """
+
+    ESCAPE = re.compile(r"\x1b\[(\d*)([ABCJ])")
+
+    def __init__(self, width=24):
+        self.width = width
+        self.rows = [""]
+        self.row = self.column = 0
+
+    def _put(self, char):
+        while len(self.rows) <= self.row:
+            self.rows.append("")
+        line = self.rows[self.row].ljust(self.column)
+        self.rows[self.row] = line[: self.column] + char + line[self.column + 1 :]
+        self.column += 1
+        if self.column >= self.width:
+            self.column = 0
+            self.row += 1
+
+    def write(self, text):
+        i = 0
+        while i < len(text):
+            match = self.ESCAPE.match(text[i:])
+            if match:
+                count, kind = int(match.group(1) or 0), match.group(2)
+                if kind == "A":
+                    self.row = max(0, self.row - count)
+                elif kind == "B":
+                    self.row += count
+                elif kind == "C":
+                    self.column += count
+                elif kind == "J":
+                    while len(self.rows) <= self.row:
+                        self.rows.append("")
+                    self.rows[self.row] = self.rows[self.row][: self.column]
+                    del self.rows[self.row + 1 :]
+                i += match.end()
+                continue
+            char = text[i]
+            if char == "\r":
+                self.column = 0
+            elif char == "\n":
+                self.row += 1
+                self.column = 0
+            else:
+                self._put(char)
+            i += 1
+
+    def flush(self):
+        pass
+
+    @property
+    def lines(self):
+        return [row.rstrip() for row in self.rows]
+
+
+PROMPT = "you > "
+
+
+def painted(text, cursor=None, width=24, before=None):
+    """Type `text` into a `width`-column terminal; return the screen."""
+    screen = Screen(width)
+    row = 0
+    with mock.patch.object(keys, "_terminal_width", return_value=width),          mock.patch.object(keys, "_ansi_available", return_value=True):
+        if before is not None:
+            row = keys._redraw(PROMPT, before, len(before), row, stream=screen)
+        row = keys._redraw(
+            PROMPT, text, len(text) if cursor is None else cursor, row, stream=screen
+        )
+    return screen
+
+
+def test_a_wrapped_line_does_not_repeat_itself():
+    """The reported bug: past the terminal width, `\r` returns to the start of
+    the *visual* row rather than the line, so every keystroke repainted the
+    prompt and the first row's worth of text underneath — once per character."""
+    screen = painted("tell me about the coffee")
+
+    assert screen.lines == ["you > tell me about the", "coffee"]
+    assert screen.lines.count("you > tell me about the") == 1
+
+
+def test_a_line_that_shrinks_gives_its_second_row_back():
+    """The old space-padding only ever cleared the tail of one row, so deleting
+    back past a boundary left the rest of the text below the cursor."""
+    screen = painted("tell me", before="tell me about the coffee")
+
+    assert screen.lines == ["you > tell me"]
+
+
+@pytest.mark.parametrize("cursor,row,column", [(0, 0, 6), (3, 0, 9), (24, 1, 6)])
+def test_the_cursor_lands_where_it_belongs_on_a_wrapped_line(cursor, row, column):
+    screen = painted("tell me about the coffee", cursor=cursor)
+
+    assert (screen.row, screen.column) == (row, column)
+
+
+def test_text_ending_exactly_at_the_margin():
+    """Terminals differ on whether the cursor has wrapped yet, so the
+    arithmetic has to hold either way."""
+    screen = painted("x" * 18, width=24)
+
+    assert screen.lines[0] == "you > " + "x" * 18
+
+
+def test_a_line_that_fits_is_unchanged():
+    screen = painted("short")
+    assert screen.lines == ["you > short"]
+
+
+def test_finishing_a_wrapped_line_lands_below_all_of_it():
+    """A bare newline from mid-wrap leaves the tail above it and the next
+    prompt written over the middle."""
+    screen = Screen(24)
+    with mock.patch.object(keys, "_terminal_width", return_value=24),          mock.patch.object(keys, "_ansi_available", return_value=True):
+        row = keys._redraw(PROMPT, "tell me about the coffee", 3, 0, stream=screen)
+        keys._finish_line(PROMPT, "tell me about the coffee", row, stream=screen)
+
+    assert screen.row == 2          # past both rows of the line
+    assert screen.column == 0
+
+
+def test_the_width_is_never_zero():
+    """A division by it happens on every keystroke."""
+    with mock.patch.object(keys.shutil, "get_terminal_size", side_effect=OSError):
+        assert keys._terminal_width() > 0

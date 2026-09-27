@@ -1,13 +1,20 @@
 """Shared test fixtures.
 
-The one thing here is a guarantee: **no test may write to the real
-``~/.majordomo``.**
+The one thing here is a guarantee: **no test may write to any directory the
+developer actually uses.** That means ``~/.majordomo`` and ``~/.claude``.
 
 This is not hypothetical. The hook swallows its failures into
 ``~/.majordomo/error.log``, and several tests deliberately provoke failures —
 so before this fixture existed, running the suite quietly appended tracebacks
 with pytest paths in them to the developer's own log, where they'd later look
 like a real bug in a real session.
+
+``~/.claude`` was the same hole, still open. ``install.install()`` defaults to
+``paths.claude_settings_path()``, and the only thing keeping the suite off the
+real file was that every case in ``test_install.py`` passes ``settings_path=``
+by hand and nothing drives ``install-hooks`` through ``cli.main``. Both are
+conventions, not guarantees — one test answering "yes" to a hooks prompt would
+have rewritten the developer's live Claude Code configuration.
 """
 from __future__ import annotations
 
@@ -20,6 +27,21 @@ def isolated_home(tmp_path, monkeypatch):
     home = tmp_path / "majordomo-home"
     home.mkdir()
     monkeypatch.setenv("MAJORDOMO_HOME", str(home))
+    return home
+
+
+@pytest.fixture(autouse=True)
+def isolated_claude_home(tmp_path, monkeypatch):
+    """Point CLAUDE_CONFIG_DIR at a per-test directory, for every test.
+
+    The companion to ``isolated_home``, for the *other* directory this project
+    writes to. ``paths.claude_settings_path()`` honours this variable, so the
+    default target of ``install.install()`` becomes a temporary file and a test
+    that installs hooks for real cannot touch the developer's own settings.
+    """
+    home = tmp_path / "claude-home"
+    home.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
     return home
 
 

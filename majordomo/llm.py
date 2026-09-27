@@ -38,7 +38,18 @@ class MissingApiKey(Exception):
 
 
 class LLMError(Exception):
-    """A request failed after all retries. Recoverable — the caller degrades."""
+    """A request failed after all retries. Recoverable — the caller degrades.
+
+    ``status`` carries the HTTP status when there was one, so ``_explain`` can
+    tell a permanent failure from a transient one without parsing it back out of
+    the message. Kept as an attribute rather than threaded through the dozen
+    places that display an ``LLMError``: the advice ends up *in* the message, so
+    every existing caller shows it without knowing it exists.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class QuotaExhausted(LLMError):
@@ -397,6 +408,94 @@ def complete(messages: list[dict], brain: BrainConfig, model: str) -> str:
     return content if isinstance(content, str) else ""
 
 
+def _roles_using(brain: BrainConfig, model: str) -> list[tuple[str, str, str]]:
+    """Which of the six roles point at this model id. Read from the config.
+
+    The role is not passed in anywhere, and it does not need to be: ``brain``
+    already holds the mapping, so it can be read backwards. More than one role
+    can match — pointing every role at one local model is the normal Ollama
+    setup — and all matches are named, because all of them need editing.
+    """
+    from majordomo.config import MODEL_ROLES
+
+    if not model:
+        # An empty id matches every *unset* role, which would name
+        # `agent_model` and `fallback_model` as the culprits for a request that
+        # had nothing to do with either. "Not set" is not "set to this".
+        return []
+
+    return [
+        (label, field, purpose)
+        for label, field, purpose in MODEL_ROLES
+        if (getattr(brain, field, "") or "") == model
+    ]
+
+
+def _explain(message: str, brain: BrainConfig, model: str, status: int | None) -> str:
+    """Append what to do about it, when there is something to do.
+
+    The failure this project is most likely to hand someone is a default going
+    stale: the shipped models are OpenRouter *free* ids, and free ids appear and
+    vanish. That arrived as a wall of JSON naming a model id, with nothing to say
+    the id is a config value, which role was using it, or that ``mj config``
+    exists — so the most probable failure read like a bug in the tool rather than
+    a line to edit.
+
+    Only permanent failures get advice. A 429 or a 503 has already been retried
+    and has nothing to do with configuration, and telling someone to edit their
+    models because a provider was briefly busy would be worse than saying
+    nothing.
+    """
+    if status is None or status in RETRYABLE_STATUS:
+        # No status means a transport failure; a retryable one has been retried.
+        return message
+
+    if status == 401:
+        if not brain.api_key_env:
+            # A keyless config meeting a 401 is not a missing key — it is a
+            # disagreement. The config says this endpoint wants no auth and the
+            # server says otherwise, so "check your key variable" would name a
+            # variable that deliberately does not exist.
+            return (
+                f"{message}\n"
+                f"  This endpoint wants credentials, but `brain.api_key_env` is "
+                f"empty, which means\n"
+                f"  \"no key needed\" — so none was sent. Either point it at a "
+                f"variable holding a\n"
+                f"  key, or check that `brain.base_url` is the local server you "
+                f"meant."
+            )
+        return (
+            f"{message}\n"
+            f"  The provider rejected the credentials. Check {brain.api_key_env} in "
+            f"~/.majordomo/.env.\n"
+            f"  (`mj config` shows which variable is in use, and whether it is set.)"
+        )
+
+    lines = [
+        f"  {model} was rejected and will keep being rejected — either the id or",
+        "  this account's access to it. Free model ids come and go, so this is "
+        "usually a",
+        "  shipped default that has aged out rather than anything you did.",
+    ]
+
+    roles = _roles_using(brain, model)
+    if roles:
+        # One per line rather than run together in a sentence: more than one role
+        # can point at the same model, and a comma-joined list both reads badly
+        # and hides that each one is a separate line to edit.
+        width = max(len(field) for _l, field, _p in roles)
+        lines.append("  Set by:")
+        lines += [f"    brain.{field:<{width}}   {purpose}" for _l, field, purpose in roles]
+
+    # No path named here. `brain` does not carry where it was loaded from, so
+    # printing the default location told anyone using `--config other.yml` to edit
+    # the wrong file — confidently. `mj config` already prints which file is in
+    # use, so pointing at it is both shorter and correct in every case.
+    lines.append("  `mj config` shows all six roles and which file they came from.")
+    return message + "\n" + "\n".join(lines)
+
+
 def _request(
     messages: list[dict], brain: BrainConfig, model: str, extra: dict
 ) -> dict:
@@ -416,13 +515,25 @@ def _request(
     except LLMError as primary:
         fallback = (brain.fallback_model or "").strip()
         if not fallback or fallback == model:
-            raise
+            # Enriched here rather than where it was raised, so the advice is
+            # composed exactly once however the request gave up.
+            raise LLMError(
+                _explain(str(primary), brain, model, primary.status), primary.status
+            ) from primary
         try:
             return _request_one(messages, brain, fallback, extra)
+        except QuotaExhausted:
+            # The fallback hitting an account-wide cap is the same clear sentence
+            # the primary's would have been. Wrapping it in "X failed; fallback
+            # also failed" buried it.
+            raise
         except LLMError as secondary:
-            raise LLMError(
+            combined = (
                 f"{model} failed ({primary}); fallback {fallback} also failed "
                 f"({secondary})"
+            )
+            raise LLMError(
+                _explain(combined, brain, model, primary.status), primary.status
             ) from secondary
 
 
@@ -430,21 +541,37 @@ def _request_one(
     messages: list[dict], brain: BrainConfig, model: str, extra: dict
 ) -> dict:
     """One model, with retries. See ``_request`` for the fallback layer."""
-    api_key = os.environ.get(brain.api_key_env)
-    if not api_key:
-        raise MissingApiKey(
-            f"Set the {brain.api_key_env} environment variable with your "
-            f"{brain.provider} API key."
-        )
+    # An empty ``api_key_env`` means "this endpoint wants no key at all", which
+    # is how you reach a local server — Ollama, llama.cpp, LM Studio. Every
+    # model became a config value, and ``base_url`` could already point
+    # anywhere, but this check made a keyless endpoint unreachable: there was no
+    # way to say "no key" that did not read as "you forgot the key".
+    #
+    # Naming a variable is still a promise that it holds something, so a *named*
+    # variable that is unset keeps raising. That is the case the message below
+    # was written for, and the common one.
+    if brain.api_key_env:
+        api_key = os.environ.get(brain.api_key_env)
+        if not api_key:
+            raise MissingApiKey(
+                f"Set the {brain.api_key_env} environment variable with your "
+                f"{brain.provider} API key."
+            )
+    else:
+        api_key = ""
 
     url = f"{brain.base_url}/chat/completions"
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
         # OpenRouter uses these for attribution on free-tier models.
         "HTTP-Referer": "https://github.com/Navaneethp007/majordomo",
         "X-Title": "Majordomo",
     }
+    if api_key:
+        # Sent only when there is one. A local server that ignores the header is
+        # common, but one that rejects `Bearer ` with nothing after it is not
+        # unheard of, and an empty credential is worse than no credential.
+        headers["Authorization"] = f"Bearer {api_key}"
     payload = {
         "model": model,
         "messages": messages,
@@ -454,11 +581,15 @@ def _request_one(
     }
 
     last_exc: Exception | None = None
+    # The status of the last HTTP response, so the caller can tell a permanent
+    # failure from a retried one. None means it never got that far.
+    last_status: int | None = None
     for attempt in range(MAX_ATTEMPTS):
         try:
             response = _post(url, headers=headers, json=payload, timeout=brain.timeout)
             if not response.is_success:
                 last_exc = Exception(f"HTTP {response.status_code}: {response.text[:300]}")
+                last_status = response.status_code
 
                 # Permanent failures are not worth a second look. A 403 on
                 # OpenRouter means the model is gated to partner apps
@@ -509,6 +640,9 @@ def _request_one(
                 last_exc = Exception(
                     f"HTTP {response.status_code} carrying an error: {message}"
                 )
+                # The envelope's own code, not the 200 it arrived wearing — a
+                # failure wearing a success code is still that failure.
+                last_status = code if isinstance(code, int) else response.status_code
                 # A 200 whose body is an error is a failure wearing a success
                 # code, so classify it the way the status *should* have been.
                 # Retrying a permanent one only adds latency to a certain
@@ -543,4 +677,4 @@ def _request_one(
             if attempt < MAX_ATTEMPTS - 1:
                 time.sleep(min(2.0**attempt, MAX_BACKOFF_SECONDS))
 
-    raise LLMError(str(last_exc))
+    raise LLMError(str(last_exc), last_status)

@@ -25,6 +25,8 @@ like an empty document.
 """
 from __future__ import annotations
 
+from majordomo import install_hint
+
 from pathlib import Path
 
 
@@ -47,7 +49,7 @@ def _extract_pdf(path: Path) -> str:
         from pypdf import PdfReader
     except ImportError as exc:
         raise ExtractorMissing(
-            "reading PDFs needs an extra package — run: pip install majordomo[documents]"
+            f"reading PDFs needs an extra package — run: {install_hint('documents')}"
         ) from exc
 
     from pypdf.errors import DependencyError, PdfReadError
@@ -108,8 +110,7 @@ def _extract_docx(path: Path) -> str:
         import docx
     except ImportError as exc:
         raise ExtractorMissing(
-            "reading Word files needs an extra package — run: "
-            "pip install majordomo[documents]"
+            f"reading Word files needs an extra package — run: {install_hint('documents')}"
         ) from exc
 
     try:

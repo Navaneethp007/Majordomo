@@ -3,8 +3,17 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "majordomo"
-version = "0.1.0"
+# The distribution is `mj`; the import package stays `majordomo`.
+#
+# Two reasons, and the first is simply that `majordomo` is taken on PyPI
+# (0.2.0, an unrelated Google Chat package). The second is that it turns out
+# better: `uv tool install mj` then `mj` makes the word you install and the
+# word you type the same. A dist name differing from the import name is
+# ordinary, and `from majordomo import agent` keeps working.
+name = "mj"
+# Single-sourced from the package, which is where `mj --version` reads it.
+# These were two independent literals that had no way of disagreeing loudly.
+dynamic = ["version"]
 description = "A personal assistant for your terminal: talks with your dev context loaded, and acts on it"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +37,9 @@ dependencies = [
 ]
 
 [project.scripts]
-majordomo = "majordomo.cli:main"
+# One command, one promise. There was a second `majordomo` entry point; two
+# names for one door is exactly what this release is reducing, and nothing is
+# published under it yet, so it goes now rather than becoming a promise.
 mj = "majordomo.cli:main"
 
 [project.optional-dependencies]
@@ -44,6 +55,9 @@ voice = ["sounddevice>=0.4"]
 documents = ["pypdf>=4.0", "python-docx>=1.1"]
 tray = ["pystray>=0.19", "Pillow>=10.0"]
 dev = ["pytest>=8.0"]
+
+[tool.setuptools.dynamic]
+version = { attr = "majordomo.__version__" }
 
 # The annotated example config ships with the package: `mj config --init`
 # has to work for a wheel install, which has no repo root to read from.

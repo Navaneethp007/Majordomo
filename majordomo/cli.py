@@ -68,6 +68,8 @@ def safe_print(text: str = "", file=None) -> None:
 
 
 def _load_config(args):
+    import yaml
+
     from majordomo import config as config_module
     from majordomo.config import ConfigFileNotFound
 
@@ -75,6 +77,21 @@ def _load_config(args):
         return config_module.load(args.config)
     except ConfigFileNotFound as exc:
         print(f"error: no config file at {exc}", file=sys.stderr)
+        sys.exit(1)
+    except yaml.YAMLError as exc:
+        # A malformed config used to surface as a raw traceback. That was
+        # survivable while every path here was an explicit command; it is not now
+        # that this is what bare `mj` runs, and a stack trace is the worst
+        # possible answer to "you left a quote open on line 2".
+        from majordomo.paths import default_config_path
+
+        where = args.config or default_config_path()
+        print(f"error: could not read {where}:", file=sys.stderr)
+        print(f"  {exc}", file=sys.stderr)
+        print(
+            "Fix it, or move it aside and run `mj config --init` for a fresh one.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -239,6 +256,151 @@ def cmd_resume(args) -> None:
 # mj chat / mj start
 # ---------------------------------------------------------------------------
 
+#: Largest piped question we will send. `mj ask` has no reducer the way the
+#: briefing path does, so an oversized payload is not slow — it is a provider
+#: rejection or a surprising bill. `cat some.log | mj` is the obvious accident.
+MAX_PAYLOAD_BYTES = 16_000
+
+
+def cmd_door(args) -> None:
+    """Bare ``mj``: the front door.
+
+    ── WHY THERE IS A DOOR ──────────────────────────────────────────────────
+    This printed the sixteen-item help. That is a *tool's* contract — know what
+    you want before you arrive — and this is an assistant, which is a place you
+    go. The subcommands all still work, and scripting and the scheduled trigger
+    need them; they are just no longer the way you are expected to come in.
+
+    ── FOUR BRANCHES, AND WHY NOT TWO ───────────────────────────────────────
+    Stdin has three states, not two: a terminal, a readable pipe, and *neither*
+    — ``None`` under ``pythonw``, and a ``DontReadFromInput`` under pytest whose
+    ``isatty()`` is False and whose ``read()`` raises. So "not a terminal" does
+    not mean "go ahead and read it", and the fourth branch keeps the old
+    behaviour for the genuinely headless case rather than opening a REPL that
+    nothing can type into.
+
+    The payload check comes first because setup cannot prompt, so a piped run
+    must never reach it.
+    """
+    payload = stdin_payload()
+    if payload is not None:
+        question = payload.strip()
+        if not question:
+            print("error: ask what?", file=sys.stderr)
+            sys.exit(1)
+        size = len(question.encode("utf-8", "replace"))
+        if size > MAX_PAYLOAD_BYTES:
+            print(
+                f"error: that is {size:,} bytes of input and the limit is "
+                f"{MAX_PAYLOAD_BYTES:,} — this path sends the whole thing to the "
+                f"model in one request. Narrow it first (`head`, `grep`), or use "
+                f"`mj do` for a task that should read the file itself.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        config = _load_config(args)
+        answer_once(config, question)
+        return
+
+    if not stdin_is_interactive():
+        # Nothing to read and nobody to talk to: a pythonw process, a scheduled
+        # task, a captured test. Printing help is what this did before and is
+        # still the only useful thing available.
+        build_parser().print_help()
+        sys.exit(0)
+
+    config = _load_config(args)
+
+    from majordomo import firstrun
+
+    if firstrun.needed():
+        try:
+            report = firstrun.run(
+                write=safe_print, ask=ask, config=config, config_path=args.config
+            )
+        except KeyboardInterrupt:
+            safe_print("\n(setup interrupted — run `mj setup` to finish it)")
+            sys.exit(1)
+        _print_setup_report(report)
+        # Setup may have written a key or a config, so reload before the session
+        # reads it.
+        config = _load_config(args)
+
+    _enter_session(config, args)
+
+
+def _print_setup_report(report) -> None:
+    """One closing line, then out of the way."""
+    if report.failed:
+        safe_print("")
+        safe_print(f"Setup finished, but these did not work: {', '.join(report.failed)}.")
+    safe_print("")
+    safe_print("Ready. Ask it anything; /help lists what else it can do.")
+    safe_print("")
+
+
+def cmd_setup(args) -> None:
+    """Run the first-run flow deliberately.
+
+    The door runs this once by itself, but it must also be a command you can
+    type: without it, redoing setup means deleting a marker file you would have
+    to know about, and testing the flow means faking a terminal.
+    """
+    from majordomo import firstrun
+
+    if not args.force and not firstrun.needed():
+        safe_print(f"Already set up ({firstrun.marker_path()}).")
+        safe_print("Pass --force to go through it again.")
+        return
+
+    if not stdin_is_interactive():
+        print(
+            "error: setup asks questions and stdin is not a terminal",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Through `_load_config` like every other command, so a malformed file is one
+    # sentence rather than a traceback, and so `--config` means the same thing
+    # here as it does everywhere else.
+    config = _load_config(args)
+
+    try:
+        report = firstrun.run(
+            write=safe_print, ask=ask, config=config, config_path=args.config
+        )
+    except KeyboardInterrupt:
+        safe_print("\n(interrupted)")
+        sys.exit(1)
+    _print_setup_report(report)
+
+
+def _enter_session(config, args) -> None:
+    """Open the REPL, having said anything that must be said before it opens."""
+    import os
+
+    from majordomo import chat as chat_mod
+
+    # Said once, here, rather than every turn. `session.send` deliberately folds
+    # MissingApiKey into ChatFailed and keeps the loop alive, which is right for
+    # a transient failure — but with no key at all it is right forever, and the
+    # door is now what a brand-new user runs first. Without this they would meet
+    # an endless sequence of identical failures instead of the one sentence that
+    # fixes it.
+    if config.brain.api_key_env and not os.environ.get(config.brain.api_key_env):
+        safe_print(
+            f"No API key yet: set {config.brain.api_key_env} in "
+            f"~/.majordomo/.env, or run `mj setup`."
+        )
+        safe_print("(`mj config` shows what a local, keyless model would need.)")
+        safe_print("")
+
+    try:
+        chat_mod.run(config, terminal=terminal())
+    except KeyboardInterrupt:  # pragma: no cover - the loop catches its own
+        safe_print("")
+
+
 def cmd_chat(args) -> None:
     from majordomo import chat as chat_mod
 
@@ -278,6 +440,52 @@ def cmd_chat(args) -> None:
         )
     except KeyboardInterrupt:  # pragma: no cover - the loop catches its own
         safe_print("")
+
+
+def stdin_is_interactive() -> bool:
+    """Is there a person at the keyboard we can put a question to?
+
+    Guards two cases a bare ``sys.stdin.isatty()`` does not. Under ``pythonw``
+    — which is what Task Scheduler runs, see ``trigger.py`` — ``sys.stdin`` is
+    ``None`` and the attribute lookup raises. And a stream can be closed, which
+    makes ``isatty`` raise ``ValueError``.
+    """
+    target = sys.stdin
+    if target is None:
+        return False
+    try:
+        return bool(target.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def stdin_payload() -> str | None:
+    """Everything piped or redirected in, or ``None`` when there is nothing.
+
+    ``None`` means "no payload": no stdin at all, a terminal (so the person is
+    going to type, not pipe), **or a read that failed**. That last clause is
+    load-bearing and not defensive. Under pytest's capture ``sys.stdin`` is a
+    ``DontReadFromInput``, whose ``isatty()`` is ``False`` and whose ``read()``
+    raises ``OSError`` — so "not a tty" does not imply "readable", and anything
+    shaped like ``if not isatty(): read()`` fails inside this project's own test
+    suite before it ever reaches a user.
+
+    Note this is deliberately *not* the complement of
+    ``stdin_is_interactive``. Both are false at once under pytest and under
+    pythonw, which is a real state the caller has to handle.
+    """
+    target = sys.stdin
+    if target is None:
+        return None
+    try:
+        if target.isatty():
+            return None
+        return target.read()
+    except Exception:
+        # Closed, capturing, decoding badly, or a console handle that cannot be
+        # read. None of it is distinguishable here and none of it changes the
+        # answer: there is no payload.
+        return None
 
 
 def ask(question: str) -> str:
@@ -338,7 +546,7 @@ def confirm_action(name: str, arguments: dict) -> bool:
         ):
             safe_print(f"    {line}")
 
-    if not sys.stdin.isatty():
+    if not stdin_is_interactive():
         # Piped or scripted: nobody can answer, so every gated call would be
         # declined and the agent would spend its whole turn budget being told
         # no. Say why once, and let the caller decide to pass --yes.
@@ -511,18 +719,27 @@ def cmd_config(args) -> None:
     safe_print(f"  provider   {brain.provider}  ->  {brain.base_url}")
     import os
 
-    key_state = "set" if os.environ.get(brain.api_key_env) else "NOT SET"
-    safe_print(f"  key from   {brain.api_key_env}  ({key_state})")
+    if not brain.api_key_env:
+        # An empty `api_key_env` means this endpoint wants no key. Printing
+        # "key from   (NOT SET)" for it named no variable and reported a problem
+        # that does not exist.
+        safe_print("  key        none needed (api_key_env is empty)")
+    else:
+        key_state = "set" if os.environ.get(brain.api_key_env) else "NOT SET"
+        safe_print(f"  key from   {brain.api_key_env}  ({key_state})")
     safe_print("")
     safe_print("  Models, by role:")
-    for role, model, purpose in (
-        ("worker", brain.worker_model, "compress each source"),
-        ("fuser", brain.fuser_model, "write the spoken briefing"),
-        ("reducer", brain.reducer_model, "handle an oversized payload"),
-        ("chat", brain.chat_model, "mj ask, mj chat"),
-        ("agent", brain.agent_model or f"{brain.chat_model}  (via chat)", "mj do, /agent"),
-        ("fallback", brain.fallback_model or "(none)", "when a role's model fails"),
-    ):
+    # From `config.MODEL_ROLES`, which `llm` also reads — given a model a provider
+    # rejected, it names which role pointed at it. Two copies of this table would
+    # have been two chances to disagree about what a role is for.
+    from majordomo.config import MODEL_ROLES
+
+    for role, field, purpose in MODEL_ROLES:
+        model = getattr(brain, field, "") or ""
+        if field == "agent_model" and not model:
+            model = f"{brain.chat_model}  (via chat)"
+        elif not model:
+            model = "(none)"
         safe_print(f"    {role:<9} {model}")
         safe_print(f"    {'':<9}   {purpose}")
     safe_print("")
@@ -668,20 +885,31 @@ def describe_quoting(text: str) -> str:
 
 def cmd_ask(args) -> None:
     """One question, one answer, no conversation state."""
-    from majordomo import activity as activity_mod
-    from majordomo import context as context_mod
-    from majordomo import prompts
-    from majordomo.llm import LLMError, MissingApiKey, complete
-
     config = _load_config(args)
     question = " ".join(args.question).strip()
     if not question:
         print("error: ask what?", file=sys.stderr)
         sys.exit(1)
+    answer_once(config, question, refresh=not args.no_refresh, explain=args.explain)
+
+
+def answer_once(config, question: str, *, refresh: bool = True, explain: bool = False) -> None:
+    """Ask once, print the answer, return. The whole of ``mj ask``'s body.
+
+    Takes plain values rather than an ``argparse`` namespace, because the front
+    door calls this too and its namespace carries none of ``ask``'s flags. A
+    namespace parameter here would make the door an ``AttributeError``, and
+    defaulting the flags on the root parser would push wrong defaults onto every
+    subcommand instead of failing loudly — so: values.
+    """
+    from majordomo import activity as activity_mod
+    from majordomo import context as context_mod
+    from majordomo import prompts
+    from majordomo.llm import LLMError, MissingApiKey, complete
 
     # Opportunistic, never blocking: if the cache is old we try to top it up,
     # but a failure here costs freshness, not the answer.
-    if not args.no_refresh and activity_mod.is_stale():
+    if refresh and activity_mod.is_stale():
         result = activity_mod.refresh(config)
         if result.error:
             print(f"warning: activity is stale ({result.error})", file=sys.stderr)
@@ -689,7 +917,7 @@ def cmd_ask(args) -> None:
     ctx = context_mod.build(config, query=question)
     messages = prompts.build_ask_prompt(ctx.render(), question)
 
-    if args.explain:
+    if explain:
         print(f"context: {ctx.summary()}", file=sys.stderr)
 
     try:
@@ -708,35 +936,26 @@ def cmd_ask(args) -> None:
     # One-shot, so there is nobody to ask — print the command instead of an
     # offer. Anything `/agent` would say here is wrong: there is no chat to stay
     # in, and two different instructions in one output is worse than none.
-    # The same shape as `chat._offer_agent`, deliberately. These two have
-    # disagreed twice: first about whether a leaked tool call keeps its prose,
-    # then about whether the marker branch does. Both times the branch that was
-    # already right stayed right and the sibling stayed wrong, because there was
-    # nothing making them one algorithm.
-    task = prompts.needs_agent(answer)
-    leaked = task is None and prompts.looks_like_a_tool_call(answer)
+    #
+    # The *parse* is shared with `chat._offer_agent` via `classify_reply`. These
+    # two had a copy each and disagreed twice — first about whether a leaked
+    # tool call keeps its prose, then about whether the marker branch does. Both
+    # times the branch that was already right stayed right and the sibling
+    # stayed wrong, because nothing made them one algorithm. Only the "then
+    # what" differs now, and it differs for a reason.
+    handoff = prompts.classify_reply(answer, question)
 
-    if task is not None or leaked:
-        # Whichever marker it is, keep what was written before it. A model that
-        # wrote a useful paragraph and then asked for the agent should lose the
-        # marker, not the paragraph.
-        kept = (
-            prompts.strip_tool_call(answer) if leaked
-            else prompts.strip_needs_agent(answer)
-        )
-        if kept:
-            safe_print(render_mod.render(kept))
+    if handoff is not None:
+        if handoff.kept:
+            safe_print(render_mod.render(handoff.kept))
             safe_print("")
-        if leaked:
+        if handoff.leaked:
             safe_print(prompts.NO_TOOLS_HERE)
             safe_print("")
 
-        # `not task` means the marker carried nothing; the question is the best
-        # available description of the job.
-        task = task or question
         safe_print("That needs the agent, which can read and change files:")
-        safe_print(f"  mj do {_shell_quote(task)}")
-        caveat = describe_quoting(task)
+        safe_print(f"  mj do {_shell_quote(handoff.task)}")
+        caveat = describe_quoting(handoff.task)
         if caveat:
             safe_print(f"  {caveat}")
         return
@@ -807,7 +1026,7 @@ def _resolve_similar(similar) -> str:
     safe_print(f"\n  This looks close to {similar.name!r}:")
     safe_print(f"    {similar.description}")
 
-    if not sys.stdin.isatty():
+    if not stdin_is_interactive():
         print(
             f"error: re-run with --update {similar.name} to replace it, "
             f"or --force to keep both",
@@ -1009,12 +1228,43 @@ def cmd_hook(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mj",
-        description="One spoken briefing of everything that needs you.",
+        description=(
+            "Your assistant, in the terminal. Run `mj` on its own to talk to it; "
+            "it already knows what you have been working on."
+        ),
+        # ASCII only, deliberately: argparse prints this with a plain `print`,
+        # not `safe_print`, and the front door prints help on the headless
+        # branch — under pythonw, in a scheduled task, on whatever code page the
+        # console happens to have. A help text that can raise is a help text
+        # that fails exactly when you most need it.
+        epilog=(
+            "Everything else lives inside the session: run `mj`, then /help. "
+            "The commands above are the stable ones - anything not listed here "
+            "still works but may move."
+        ),
     )
-    parser.add_argument("--version", action="version", version=f"majordomo {__version__}")
+    parser.add_argument("--version", action="version", version=f"mj {__version__}")
     parser.add_argument("--config", help="path to a config file (default: ~/.majordomo/config.yml)")
 
-    sub = parser.add_subparsers(dest="command")
+    # Bare `mj` is the front door. Set as a parent default rather than checked
+    # for afterwards: a subparser's own `set_defaults(func=…)` overwrites this
+    # one when a subcommand is given, which is what makes the branch unnecessary
+    # — and is worth a test rather than a comment, since it was the other way
+    # round before Python 3.7.
+    parser.set_defaults(func=cmd_door)
+
+    # The metavar is set explicitly because `help=argparse.SUPPRESS` is not
+    # enough on its own: it hides a subcommand's *description* but argparse still
+    # prints every name in the auto-generated `{brief,sessions,resume,…}` choice
+    # list, so a suppressed command is still advertised — the exact thing being
+    # suppressed was meant to stop. Naming the stable set here is what actually
+    # narrows the promise.
+    # Listed in the order argparse prints them below, so the summary line and the
+    # list under it read as the same list.
+    sub = parser.add_subparsers(
+        dest="command",
+        metavar="{brief,chat,do,ask,config,setup,help}",
+    )
 
     p_brief = sub.add_parser("brief", help="fetch, fuse, print and speak the briefing")
     p_brief.add_argument("--no-speak", action="store_true", help="text only")
@@ -1030,11 +1280,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_brief.set_defaults(func=cmd_brief)
 
-    p_sessions = sub.add_parser("sessions", help="list live / idle / blocked coding sessions")
+    p_sessions = sub.add_parser("sessions")
     p_sessions.add_argument("--debug", action="store_true", help="report unparseable log lines")
     p_sessions.set_defaults(func=cmd_sessions)
 
-    p_resume = sub.add_parser("resume", help="jump back into a session")
+    p_resume = sub.add_parser("resume")
     p_resume.add_argument("session_id", help="full id or a unique prefix")
     p_resume.add_argument("--dry-run", action="store_true", help="print the command, launch nothing")
     p_resume.set_defaults(func=cmd_resume)
@@ -1064,7 +1314,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_do.set_defaults(func=cmd_do)
 
-    p_review = sub.add_parser("review", help="open Claude Code on a repo to review it")
+    p_ask = sub.add_parser("ask", help="ask one question, with your context loaded")
+    p_ask.add_argument("question", nargs="+", help="what to ask")
+    p_ask.add_argument(
+        "--no-refresh", action="store_true", help="use the activity cache as-is"
+    )
+    p_ask.add_argument(
+        "--explain", action="store_true", help="report what context was loaded"
+    )
+    p_ask.set_defaults(func=cmd_ask)
+
+    p_review = sub.add_parser("review")
     p_review.add_argument(
         "directory", nargs="?", default=None, help="the repo (default: here)"
     )
@@ -1081,30 +1341,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_config.set_defaults(func=cmd_config)
 
-    p_mic = sub.add_parser("mic", help="measure your microphone, to tune voice input")
+    p_setup = sub.add_parser("setup", help="configure a key, hooks and the wake briefing")
+    p_setup.add_argument(
+        "--force", action="store_true", help="go through it again even if already set up"
+    )
+    p_setup.set_defaults(func=cmd_setup)
+
+    # `mj` used to *be* the help. Something has to still list the commands now
+    # that it opens a conversation instead, and `mj help` is what people type.
+    sub.add_parser("help", help="list these commands").set_defaults(
+        func=lambda _args: build_parser().print_help()
+    )
+
+    p_mic = sub.add_parser("mic")
     p_mic.add_argument(
         "--seconds", type=float, default=10.0, help="how long to record (default: 10)"
     )
     p_mic.set_defaults(func=cmd_mic)
 
-    p_start = sub.add_parser("start", help="scaffold a repo and open Claude Code in it")
+    p_start = sub.add_parser("start")
     p_start.add_argument("idea", nargs="+", help="what you want to build")
     p_start.add_argument(
         "--dry-run", action="store_true", help="print what would happen, create nothing"
     )
     p_start.set_defaults(func=cmd_start)
 
-    p_ask = sub.add_parser("ask", help="ask one question, with your context loaded")
-    p_ask.add_argument("question", nargs="+", help="what to ask")
-    p_ask.add_argument(
-        "--no-refresh", action="store_true", help="use the activity cache as-is"
-    )
-    p_ask.add_argument(
-        "--explain", action="store_true", help="report what context was loaded"
-    )
-    p_ask.set_defaults(func=cmd_ask)
-
-    p_activity = sub.add_parser("activity", help="what you have been doing on GitHub")
+    p_activity = sub.add_parser("activity")
     p_activity.add_argument(
         "--refresh", action="store_true", help="fetch from GitHub before showing"
     )
@@ -1119,7 +1381,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_activity.set_defaults(func=cmd_activity)
 
-    p_remember = sub.add_parser("remember", help="write, list, or forget a memory")
+    p_remember = sub.add_parser("remember")
     p_remember.add_argument(
         "text", nargs="*", help="the fact to remember; omit to list what is remembered"
     )
@@ -1138,22 +1400,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_remember.add_argument("--forget", metavar="NAME", help="delete a memory by name")
     p_remember.set_defaults(func=cmd_remember)
 
-    sub.add_parser("install-hooks", help="wire session-awareness into Claude Code").set_defaults(
+    sub.add_parser("install-hooks").set_defaults(
         func=cmd_install_hooks
     )
-    sub.add_parser("uninstall-hooks", help="remove Majordomo's Claude Code hooks").set_defaults(
+    sub.add_parser("uninstall-hooks").set_defaults(
         func=cmd_uninstall_hooks
     )
 
-    sub.add_parser("tray", help="run the resident tray icon").set_defaults(func=cmd_tray)
-    sub.add_parser(
-        "install-trigger", help="brief me automatically on wake / boot / login"
-    ).set_defaults(func=cmd_install_trigger)
-    sub.add_parser("uninstall-trigger", help="remove the scheduled tasks").set_defaults(
+    sub.add_parser("tray").set_defaults(func=cmd_tray)
+    sub.add_parser("install-trigger").set_defaults(func=cmd_install_trigger)
+    sub.add_parser("uninstall-trigger").set_defaults(
         func=cmd_uninstall_trigger
     )
 
-    p_hook = sub.add_parser("hook", help=argparse.SUPPRESS)
+    p_hook = sub.add_parser("hook")
     p_hook.add_argument("--event", required=True)
     p_hook.add_argument("--matcher", default=None)
     p_hook.set_defaults(func=cmd_hook)
@@ -1165,9 +1425,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not getattr(args, "func", None):
-        parser.print_help()
-        sys.exit(0)
+    # No "did we get a subcommand" branch: bare `mj` dispatches to `cmd_door`
+    # through the parser's own default, and a subcommand overwrites it.
 
     # Fill missing env vars from ~/.majordomo/.env before anything reads them.
     # Real environment variables still win, so this only fills gaps — and it

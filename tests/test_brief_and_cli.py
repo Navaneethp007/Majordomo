@@ -215,11 +215,173 @@ def test_hook_subcommand_always_exits_zero(monkeypatch):
     assert exc.value.code == 0
 
 
-def test_bare_invocation_prints_help(capsys):
+# ---------------------------------------------------------------------------
+# The front door
+#
+# Bare `mj` used to print help. It is now the product's single entrance, with
+# four branches, because stdin has three states and not two: a terminal, a
+# readable pipe, and neither. Under pytest it is the third — `isatty()` is False
+# *and* `read()` raises — which is exactly the state a two-branch door gets
+# wrong, so the plain `cli.main([])` case below is load-bearing.
+# ---------------------------------------------------------------------------
+
+def test_bare_invocation_with_no_readable_stdin_prints_help(capsys):
+    """The headless branch: pythonw, a scheduled task, a captured test."""
     with pytest.raises(SystemExit) as exc:
         cli.main([])
     assert exc.value.code == 0
-    assert "briefing" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "usage: mj" in out
+
+
+def test_bare_invocation_answers_a_piped_question(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "stdin_payload", lambda: "what is on today?\n")
+    asked = {}
+
+    def fake_answer(config, question, **kwargs):
+        asked["question"] = question
+        asked["kwargs"] = kwargs
+
+    monkeypatch.setattr(cli, "answer_once", fake_answer)
+
+    cli.main([])
+
+    assert asked["question"] == "what is on today?"
+    # No flags on the door, so the defaults apply and nothing is passed.
+    assert asked["kwargs"] == {}
+
+
+def test_a_piped_empty_question_is_refused(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "stdin_payload", lambda: "   \n")
+    monkeypatch.setattr(cli, "answer_once", lambda *a, **k: pytest.fail("should not ask"))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([])
+    assert exc.value.code == 1
+    assert "ask what?" in capsys.readouterr().err
+
+
+def test_an_oversized_payload_is_refused_by_size(monkeypatch, capsys):
+    """`cat some.log | mj` must not become one enormous request."""
+    monkeypatch.setattr(cli, "stdin_payload", lambda: "x" * (cli.MAX_PAYLOAD_BYTES + 1))
+    monkeypatch.setattr(cli, "answer_once", lambda *a, **k: pytest.fail("should not ask"))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "limit is" in err
+    assert "mj do" in err  # says what to use instead
+
+
+def test_interactive_stdin_opens_the_session(monkeypatch):
+    monkeypatch.setattr(cli, "stdin_payload", lambda: None)
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_enter_session", lambda config, args: None)
+
+    from majordomo import firstrun
+
+    monkeypatch.setattr(firstrun, "needed", lambda: False)
+
+    cli.main([])  # must not raise, and must not print help
+
+
+def test_the_door_runs_setup_once_then_enters(monkeypatch):
+    monkeypatch.setattr(cli, "stdin_payload", lambda: None)
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: True)
+
+    entered = []
+    monkeypatch.setattr(cli, "_enter_session", lambda config, args: entered.append(True))
+
+    from majordomo import firstrun
+
+    ran = []
+    monkeypatch.setattr(firstrun, "needed", lambda: True)
+    monkeypatch.setattr(
+        firstrun, "run", lambda **kw: ran.append(True) or firstrun.Report()
+    )
+
+    cli.main([])
+
+    assert ran == [True]
+    assert entered == [True]
+
+
+def test_a_malformed_config_is_a_sentence_not_a_traceback(monkeypatch, capsys, tmp_path):
+    """Survivable while every path was an explicit command; not now.
+
+    `config.load` lets `yaml`'s exception through and `_load_config` only caught
+    `ConfigFileNotFound`, so an unclosed quote met you with a `ScannerError`
+    stack trace — as the first thing bare `mj` does.
+    """
+    from majordomo import paths
+
+    bad = paths.majordomo_home() / "config.yml"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text('brain:\n  chat_model: "unclosed\n', encoding="utf-8")
+
+    monkeypatch.setattr(cli, "stdin_payload", lambda: "hello")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([])
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "could not read" in err
+    assert "config --init" in err  # says what to do about it
+    assert "Traceback" not in err
+
+
+def test_a_malformed_config_stops_setup_cleanly_too(monkeypatch, capsys):
+    from majordomo import paths
+
+    bad = paths.majordomo_home() / "config.yml"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("brain: [\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: True)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["setup", "--force"])
+
+    assert exc.value.code == 1
+    assert "could not read" in capsys.readouterr().err
+
+
+def test_a_subcommand_still_beats_the_door_default():
+    """Pinned deliberately.
+
+    The door is the *parent* parser's default `func`. A subparser's own
+    `set_defaults` overwrites it on Python 3.7+, which is what makes the old
+    "did we get a subcommand" branch unnecessary — but before 3.7 the parent
+    default won, and `mj brief` would have opened a REPL. Worth a test rather
+    than a comment.
+    """
+    parser = cli.build_parser()
+    assert parser.parse_args([]).func is cli.cmd_door
+    assert parser.parse_args(["brief"]).func is cli.cmd_brief
+    assert parser.parse_args(["config"]).func is cli.cmd_config
+
+
+def test_help_lists_the_stable_commands_and_not_the_rest(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+
+    for stable in ("brief", "do", "ask", "chat", "config", "setup", "help"):
+        assert stable in out, f"{stable} should be advertised"
+
+    # Still dispatch, no longer advertised — that is what buys the freedom to
+    # move them. `hook` was already hidden.
+    for internal in ("install-trigger", "uninstall-hooks", "activity"):
+        assert internal not in out, f"{internal} should be suppressed"
+
+
+def test_suppressed_commands_still_work(monkeypatch):
+    """Hidden is not removed."""
+    parser = cli.build_parser()
+    assert parser.parse_args(["activity"]).func is cli.cmd_activity
+    assert parser.parse_args(["tray"]).func is cli.cmd_tray
 
 
 # ---------------------------------------------------------------------------

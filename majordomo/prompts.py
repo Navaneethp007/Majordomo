@@ -1,6 +1,7 @@
 """Prompt assembly. Pure string building — no I/O, so it is trivially testable."""
 from __future__ import annotations
 import re
+from dataclasses import dataclass
 
 from majordomo.models import SourceReport
 
@@ -276,6 +277,62 @@ NO_TOOLS_HERE = (
     "I started to call a tool, but this is a plain conversation — I cannot "
     "read files or run commands here, so nothing happened."
 )
+
+
+@dataclass(frozen=True)
+class AgentHandoff:
+    """A reply that wants the agent, already parsed.
+
+    Attributes:
+        task: What to hand over. Never empty — see ``classify_reply``.
+        leaked: The model wrote a tool call instead of using the marker.
+        kept: The prose to show first, with the marker or call removed. May be
+            empty, when the reply was nothing but the marker.
+    """
+
+    task: str
+    leaked: bool
+    kept: str
+
+
+def classify_reply(reply: str, asked_for: str) -> AgentHandoff | None:
+    """Does this reply want the agent? ``None`` when it does not.
+
+    There are two ways in. The model is *told* to emit ``NEEDS_AGENT: <task>``
+    when a question genuinely needs the disk — a structural signal, parsed here
+    rather than inferred from prose, the same discipline as ``needs_you``. And
+    when it ignores that and writes out a tool call instead, that is the same
+    request wearing the wrong syntax, so it counts too.
+
+    ── WHY THIS IS ONE FUNCTION ─────────────────────────────────────────────
+    ``chat._offer_agent`` and ``cli.cmd_ask`` both need this, and they had a
+    copy each. The copies disagreed twice: first about whether a leaked tool
+    call keeps the prose that came with it, then about whether the marker branch
+    does. Both times the branch that was already right stayed right and its
+    sibling stayed wrong, because nothing made them one algorithm.
+
+    What the two callers genuinely do differ on is what happens *next* — chat
+    asks permission, ``mj ask`` prints the command, because a one-shot has
+    nobody to ask. That difference is real and stays with them. The parse is not
+    a difference, so it lives here.
+    """
+    task = needs_agent(reply)
+    leaked = task is None and looks_like_a_tool_call(reply)
+    if task is None and not leaked:
+        return None
+
+    # An empty task means the marker arrived carrying nothing. It is still a
+    # hand-off — the alternative is printing the protocol token at the user —
+    # so fall back to what was actually asked for.
+    if not task:
+        task = asked_for
+
+    # Keep whatever prose came with it, on either branch. A model that wrote
+    # three good paragraphs and one stray marker should lose the marker, not the
+    # paragraphs, and declining the offer must not cost you the answer.
+    kept = strip_tool_call(reply) if leaked else strip_needs_agent(reply)
+
+    return AgentHandoff(task=task, leaked=leaked, kept=kept)
 
 
 def build_ask_prompt(context_text: str, question: str) -> list[dict]:
