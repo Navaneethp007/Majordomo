@@ -128,8 +128,8 @@ brain:
 # Optional in both directions. Set enabled: false and Majordomo prints instead
 # of speaking, and `/voice` disappears from the chat prompt.
 #
-# Needs extras:  uv tool install --force "mj[nvidia]"   speech out, and in
-#                uv tool install --force "mj[voice]"    microphone capture
+# Needs extras:  uv tool install --force "majordomo-cli[nvidia]"   speech out, and in
+#                uv tool install --force "majordomo-cli[voice]"    microphone capture
 voice:
   enabled: true
   provider: nvidia

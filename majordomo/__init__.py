@@ -4,10 +4,12 @@
 #: attribute rather than carrying its own literal, so the two cannot disagree.
 __version__ = "0.1.0"
 
-#: The distribution name, which is **not** the name of this package. `majordomo`
-#: was taken on PyPI, and `mj` turned out better anyway: the word you install and
-#: the word you type are the same one.
-DISTRIBUTION = "mj"
+#: The distribution name, which is **not** the name of this package and **not**
+#: the name of the command either. `majordomo` is taken on PyPI; `mj` is untaken
+#: but rejected by it ("The name 'mj' isn't allowed" — too short or too close to
+#: something else, a rule the JSON API cannot be asked about). The command stays
+#: `mj`, because `[project.scripts]` is independent of all this.
+DISTRIBUTION = "majordomo-cli"
 
 
 def install_hint(extra: str) -> str:

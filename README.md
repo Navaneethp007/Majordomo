@@ -13,7 +13,7 @@ surfaces only what needs a decision, when you ask it to.
 ## Install, and the only command you need
 
 ```
-uv tool install mj
+uv tool install majordomo-cli
 mj
 ```
 
@@ -36,13 +36,19 @@ place you go, and its front door is itself. Sixteen subcommands meant knowing wh
 wanted before you arrived — and meant sixteen names that could never change. One door is
 one promise.
 
+**Three names, and they differ on purpose.** You install `majordomo-cli`, you type `mj`,
+and you import `majordomo`. `majordomo` was taken on PyPI by an unrelated package, and
+plain `mj` is refused by it — untaken but not allowed, which the index will only tell you
+at upload time. `[project.scripts]` is independent of all that, so the command is one
+short word regardless.
+
 `uv tool` (or `pipx`) rather than plain `pip`, because an app installed into whichever
 virtualenv happened to be active disappears when you deactivate it. Plain `pip` still
 works and is worth using if you want to import from this — `agent.run`, `brief.run`,
-`context.build` are real library surface, and the import package is still `majordomo`:
+`context.build` are real library surface:
 
 ```
-pip install mj
+pip install majordomo-cli
 from majordomo import agent, brief, context
 ```
 
@@ -133,13 +139,13 @@ Optional extras, none required for text:
 
 | Extra | For |
 |---|---|
-| `mj[nvidia]` | speech, in and out, via NVIDIA Riva (gRPC, hence separate) |
-| `mj[voice]` | microphone capture — the one dependency speech *input* costs |
-| `mj[documents]` | text out of PDFs and Word files |
-| `mj[tray]` | the resident tray icon |
+| `majordomo-cli[nvidia]` | speech, in and out, via NVIDIA Riva (gRPC, hence separate) |
+| `majordomo-cli[voice]` | microphone capture — the one dependency speech *input* costs |
+| `majordomo-cli[documents]` | text out of PDFs and Word files |
+| `majordomo-cli[tray]` | the resident tray icon |
 
 Adding one later means reinstalling with it named, e.g.
-`uv tool install --force "mj[voice]"`. Every "not installed" message tells you the line.
+`uv tool install --force "majordomo-cli[voice]"`. Every "not installed" message tells you the line.
 
 ## The door
 

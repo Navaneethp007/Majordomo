@@ -3,14 +3,19 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# The distribution is `mj`; the import package stays `majordomo`.
+# The distribution is `majordomo-cli`; the import package stays `majordomo`
+# and the command stays `mj`. All three differ, for reasons worth recording.
 #
-# Two reasons, and the first is simply that `majordomo` is taken on PyPI
-# (0.2.0, an unrelated Google Chat package). The second is that it turns out
-# better: `uv tool install mj` then `mj` makes the word you install and the
-# word you type the same. A dist name differing from the import name is
-# ordinary, and `from majordomo import agent` keeps working.
-name = "mj"
+# `majordomo` is taken on PyPI (0.2.0, an unrelated Google Chat package).
+# `mj` is untaken but *rejected*: PyPI answers 400 "The name 'mj' isn't
+# allowed" for names that are too short, reserved, or too close to an existing
+# project — and a 404 from the API means only "nobody has it", never "you may
+# have it". The upload is the only test of that, which is worth knowing before
+# planning around a name.
+#
+# `[project.scripts]` below is independent of this, so what you type is `mj`
+# whatever the distribution ends up called.
+name = "majordomo-cli"
 # Single-sourced from the package, which is where `mj --version` reads it.
 # These were two independent literals that had no way of disagreeing loudly.
 dynamic = ["version"]
