@@ -2,7 +2,7 @@
 
 #: Single source of truth for the version. ``pyproject.toml`` reads this
 #: attribute rather than carrying its own literal, so the two cannot disagree.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 #: The distribution name, which is **not** the name of this package and **not**
 #: the name of the command either. `majordomo` is taken on PyPI; `mj` is untaken
