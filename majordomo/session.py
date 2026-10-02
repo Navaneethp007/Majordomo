@@ -466,6 +466,71 @@ def clear(session: Session) -> None:
     session.path = _new_transcript_path()
 
 
+def pick_conversation(write, stream=None) -> Path | None:
+    """Let the user choose a saved conversation. Returns a path, or None.
+
+    ── WHY HERE AND NOT IN ``cli`` ──────────────────────────────────────────
+    It started in ``cli``, on the grounds that reaching *up* from here to the
+    REPL would pull the whole thing in for two functions. That reasoning was
+    sound and the conclusion was not: it left the REPL importing ``cli``, and
+    ``cli``'s own docstring describes it as the outermost layer — the one module
+    that catches the typed exceptions raised below it. Nothing had imported it
+    before, and ``cmd_chat`` imports ``chat``, so the result was a
+    chat → cli → chat cycle that worked only because both imports sit inside
+    functions.
+
+    This is three lines of orchestration over ``saved_sessions``,
+    ``describe_session`` and ``keys.choose`` — all of which are *below* both
+    callers. Here it is importable by either with no cycle at all.
+
+    Args:
+        write: where to report having nothing to offer. ``safe_print`` from the
+            CLI, ``terminal.write`` from the REPL — the seam that was the only
+            real reason this lived in ``cli``.
+        stream: where the picker draws. Defaults to stdout; a test aims it at a
+            fake screen.
+    """
+    from majordomo import keys
+
+    saved = list(reversed(saved_sessions()))   # newest first
+    if not saved:
+        write("No saved conversations yet.")
+        return None
+
+    try:
+        index = keys.choose(
+            "Which conversation?",
+            [describe_session(path) for path in saved],
+            stream=stream,
+        )
+    except KeyboardInterrupt:
+        write("")
+        return None
+
+    return None if index is None else saved[index]
+
+
+def switch_to(session: Session, transcript: Path) -> int:
+    """Load a saved conversation into this session. Returns how many turns.
+
+    The counterpart to ``clear``, and it keeps the frozen system prefix for the
+    same reason: rebuilding it would reread memory and activity and produce
+    different bytes, breaking the byte-identical guarantee the whole prefix is
+    arranged around. Switching is about the turns.
+
+    The conversation being left is **not** saved here — the caller does that
+    first, so that a failure to read the new transcript cannot cost you the one
+    you were in.
+    """
+    turns = load_turns(transcript)
+    session.turns = list(turns)
+    session.log = list(turns)
+    session.compactions = 0
+    session.compaction_failed = False
+    session.path = transcript
+    return len(turns)
+
+
 # ---------------------------------------------------------------------------
 # The REPL
 # ---------------------------------------------------------------------------

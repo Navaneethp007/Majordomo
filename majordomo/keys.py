@@ -141,6 +141,14 @@ def _terminal_width(stream=None) -> int:
         return 80
 
 
+def _terminal_height(stream=None) -> int:
+    """How many rows there are to repaint within. Never zero."""
+    try:
+        return max(1, shutil.get_terminal_size(fallback=(80, 24)).lines)
+    except (OSError, ValueError):
+        return 24
+
+
 def _redraw(prompt: str, text: str, cursor: int, row: int, stream=None) -> int:
     """Repaint the whole line and park the cursor. Returns its new row.
 
@@ -319,3 +327,188 @@ def read_line(prompt: str, trigger: str = "") -> str | object:
         text = text[:cursor] + char + text[cursor:]
         cursor += 1
         row = _redraw(prompt, text, cursor, row)
+
+
+#: Escape, for cancelling a picker. Ctrl+C does too, by raising.
+_ESCAPE = "\x1b"
+
+#: How many options to show at once, at most. A longer list scrolls rather than
+#: repainting a screenful.
+#:
+#: This is a ceiling, not the answer — see ``_visible_count``. A list taller than
+#: the *terminal* cannot be repainted at all, because the rows we would move back
+#: up to have already scrolled away, so the real limit is whichever of the two is
+#: smaller. Naming that hazard here and then not measuring the terminal was how
+#: the first version of this shipped.
+VISIBLE_OPTIONS = 10
+
+
+def _visible_count(stream=None) -> int:
+    """How many options actually fit. At least one.
+
+    Two rows go to the prompt and the hint, so the window is the terminal's
+    height minus those — clamped to ``VISIBLE_OPTIONS`` because ten is already
+    more than anyone scans, and clamped to one because a terminal reporting two
+    rows must still show something rather than dividing down to nothing.
+
+    Reachable in an IDE panel dragged small or a tmux split, not in a normal
+    window — which is exactly why it needs measuring rather than assuming.
+    """
+    return max(1, min(VISIBLE_OPTIONS, _terminal_height(stream) - 2))
+
+
+def choose(prompt: str, options: list[str], stream=None) -> int | None:
+    """Pick one of ``options`` with the arrow keys. Returns its index, or None.
+
+    ── WHY THIS LIVES WITH THE LINE EDITOR ──────────────────────────────────
+    It is the same job: own the raw input, repaint rows, put the cursor back.
+    ``read_line`` already learned the hard parts — that ``getwch`` returns a
+    prefix *and* a scan code for an arrow, and that ``\r`` returns to the start
+    of the visual row rather than the line — so a picker written anywhere else
+    would have to learn them again.
+
+    Degrades the same way too. Without raw reads — a pipe, a redirect, any
+    platform without ``msvcrt`` — there are no arrow keys to press, so it prints
+    a numbered list and reads a number. Scripted input has no use for a cursor.
+
+    Returns:
+        The chosen index, or ``None`` if the user cancelled with Escape.
+
+    Raises:
+        KeyboardInterrupt: Ctrl+C, re-raised deliberately so a caller can tell
+            "I changed my mind" from "I picked nothing" — the distinction
+            ``cli.ask`` was fixed to preserve.
+    """
+    if not options:
+        return None
+
+    out = stream if stream is not None else sys.stdout
+
+    if not raw_reads_available():
+        return _choose_by_number(prompt, options, out)
+
+    import msvcrt
+
+    cursor = 0
+    top = 0
+    painted = 0
+
+    while True:
+        # Measured every repaint, not once: a terminal can be resized mid-pick,
+        # and the window is what the move-up arithmetic depends on.
+        visible = _visible_count(out)
+        top = _window_top(cursor, top, len(options), visible)
+        painted = _paint_options(prompt, options, cursor, top, painted, visible, out)
+
+        char = msvcrt.getwch()
+
+        if char in _PREFIXES:
+            code = msvcrt.getwch()
+            if code == _UP:
+                cursor = (cursor - 1) % len(options)
+            elif code == _DOWN:
+                cursor = (cursor + 1) % len(options)
+            elif code == _HOME:
+                cursor = 0
+            elif code == _END:
+                cursor = len(options) - 1
+            continue
+
+        if char in _ENTER:
+            _finish_options(painted, out)
+            return cursor
+        if char == _ESCAPE:
+            _finish_options(painted, out)
+            return None
+        if char == _CTRL_C:
+            _finish_options(painted, out)
+            raise KeyboardInterrupt
+        if char in (_CTRL_Z, _CTRL_D):
+            _finish_options(painted, out)
+            return None
+
+
+def _window_top(cursor: int, top: int, count: int, visible: int) -> int:
+    """Which option is at the top, so the cursor stays on screen."""
+    if count <= visible:
+        return 0
+    top = min(top, cursor)
+    top = max(top, cursor - visible + 1)
+    return max(0, min(top, count - visible))
+
+
+def _paint_options(prompt, options, cursor, top, painted, visible, out) -> int:
+    """Repaint the list. Returns how many rows it occupies.
+
+    ``painted`` is how many rows went down last time, which is what lets the
+    cursor get back to the top. The same bookkeeping ``_redraw`` needed once the
+    line could wrap, and for the same reason: there is no way to ask a terminal
+    where it is.
+    """
+    window = options[top : top + visible]
+
+    if not _ansi_available(out):
+        # No cursor control, so no repainting: print the list once per keypress
+        # and let it scroll. Ugly, and only reachable on a terminal that cannot
+        # do what every terminal since 1979 can.
+        out.write(prompt + "\n")
+        for index, text in enumerate(window):
+            out.write(("> " if top + index == cursor else "  ") + text + "\n")
+        out.flush()
+        return 0
+
+    if painted:
+        out.write(f"\x1b[{painted}A")
+    out.write("\r\x1b[0J")
+
+    width = _terminal_width(out)
+    out.write(prompt[: width - 1] + "\n")
+    for index, text in enumerate(window):
+        selected = top + index == cursor
+        marker = "> " if selected else "  "
+        # Reverse video for the selected row, and a marker as well rather than
+        # instead: a highlight alone is invisible in a terminal whose theme
+        # ignores it, and on a copy-pasted screenshot.
+        body = (marker + text)[: width - 1]
+        out.write(f"\x1b[7m{body}\x1b[0m\n" if selected else body + "\n")
+
+    # ASCII only. This writes straight to the stream rather than through
+    # `cli.safe_print`, so there is nothing to catch a UnicodeEncodeError — and
+    # a default Windows console is cp1252, which has no arrow glyphs. "↑↓" would
+    # crash the picker on exactly the platform this is written for. (The chat
+    # prompt's "›" survives only because cp1252 happens to include it.)
+    hint = "  up/down to move, Enter to choose, Esc to cancel"
+    if len(options) > visible:
+        hint = f"  {cursor + 1}/{len(options)} -" + hint[1:]
+    out.write(hint[: width - 1])
+    out.flush()
+
+    # prompt + options + hint, and the hint has no newline, so the cursor sits
+    # on the last row rather than below it.
+    return 1 + len(window)
+
+
+def _finish_options(painted: int, out) -> None:
+    """Leave the list on screen and move past it."""
+    out.write("\n")
+    out.flush()
+
+
+def _choose_by_number(prompt: str, options: list[str], out) -> int | None:
+    """The fallback: a numbered list and one number."""
+    out.write(prompt + "\n")
+    for index, text in enumerate(options, start=1):
+        out.write(f"  {index:>2}. {text}\n")
+    out.flush()
+
+    try:
+        answer = input("  number (Enter to cancel): ").strip()
+    except EOFError:
+        return None
+    if not answer:
+        return None
+    try:
+        chosen = int(answer)
+    except ValueError:
+        return None
+    return chosen - 1 if 1 <= chosen <= len(options) else None

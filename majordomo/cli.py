@@ -431,6 +431,17 @@ def cmd_chat(args) -> None:
             print("(`mj chat --list` shows them)", file=sys.stderr)
             sys.exit(1)
 
+    elif args.resume and stdin_is_interactive():
+        # `--resume` with no id used to take the newest silently, so picking an
+        # older one meant running `--list`, reading an id off the screen and
+        # typing a second command. Offer the list instead — but only when there
+        # is somebody to answer, because a script passing `--resume` wants the
+        # newest and must not block on a picker.
+        transcript = chat_mod.pick_conversation(safe_print)
+        if transcript is None:
+            safe_print("(nothing resumed)")
+            return
+
     try:
         chat_mod.run(
             config,
@@ -521,6 +532,46 @@ def terminal():
     return Terminal(write=safe_print, ask=ask, confirm=confirm_action)
 
 
+def _posts_publicly(name: str, arguments: dict) -> bool:
+    """Would this call put something where other people can see it?
+
+    Only ``github`` writes qualify. A commit, a file, even a force-push stays
+    between you and your own machine or your own remote until somebody looks; a
+    pull request or a comment arrives in other people's inboxes under your name.
+    """
+    if name != "github":
+        return False
+    from majordomo import tools
+
+    return tools.TOOLS["github"].requires_approval(arguments)
+
+
+def _approve_everything(name: str, arguments: dict) -> bool:
+    """The ``--yes`` confirmer — except for things other people will see.
+
+    ``--yes`` means "do not ask me about writes", and that was fine while every
+    write landed on the local disk. It now also covers opening pull requests and
+    posting comments, and the asymmetry argument from ``is_sensitive`` transfers
+    word for word: a bad local commit is recoverable with git, a comment posted
+    under your name on somebody else's pull request is not.
+
+    Worse, the non-interactive branch of ``confirm_action`` actively *recommends*
+    ``--yes``, so the scheduled and piped paths are the ones most likely to be
+    carrying it. So this is a flat refusal rather than a prompt, for the reason
+    ``is_sensitive`` gives: there is no answer to "shall I post this under your
+    name while you are not here?" that should be yes.
+    """
+    if _posts_publicly(name, arguments) and not stdin_is_interactive():
+        print(
+            "error: --yes does not cover posting to GitHub when nobody is "
+            "watching — a comment or a pull request goes out under your name "
+            "and cannot be withdrawn. Re-run this interactively.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def confirm_action(name: str, arguments: dict) -> bool:
     """Show what is about to happen and ask. The safety gate, at the terminal.
 
@@ -531,20 +582,15 @@ def confirm_action(name: str, arguments: dict) -> bool:
     from majordomo import tools
 
     safe_print(f"\n  {tools.describe_call(name, arguments)}")
-    # (see _edit_preview for why an edit is not just two truncated blocks)
 
-    if name == "write_file":
-        content = tools.as_text(arguments.get("content"))
-        lines = content.splitlines()
-        for line in lines[:12]:
-            safe_print(f"    | {line}")
-        if len(lines) > 12:
-            safe_print(f"    | … {len(lines) - 12} more lines")
-    elif name == "edit_file":
-        for line in _edit_preview(
-            tools.as_text(arguments.get("old")), tools.as_text(arguments.get("new"))
-        ):
-            safe_print(f"    {line}")
+    # What to show beyond the one-liner is `tools`' business, not the terminal's.
+    # This used to be a second `name ==` chain here, which meant every new tool
+    # needed branches in two files — and `tools.preview_call` holds the reason a
+    # preview exists at all, which is that a gate hiding what it gates
+    # manufactures confidence. `cli` still owns the indentation, so `tools` never
+    # decides what a terminal looks like.
+    for line in tools.preview_call(name, arguments):
+        safe_print(f"    {line}")
 
     if not stdin_is_interactive():
         # Piped or scripted: nobody can answer, so every gated call would be
@@ -563,58 +609,6 @@ def confirm_action(name: str, arguments: dict) -> bool:
         safe_print("")
         return False
     return answer in ("y", "yes")
-
-
-#: Lines shown per side of an edit before eliding. Small enough to read at a
-#: glance, which is the only way a confirmation prompt actually gets read.
-EDIT_PREVIEW_LINES = 8
-
-
-def _edit_preview(old: str, new: str) -> list[str]:
-    """Render an edit as the part that actually changes.
-
-    Showing the first N lines of each side is wrong when they share a prefix —
-    an append produces two blocks that look identical, the change falls off the
-    bottom, and you approve a no-op that isn't one. That happened: an edit
-    adding a whole function previewed as three unchanged lines.
-
-    So trim the common prefix and suffix first, spend the budget on the
-    difference, and always say when something was elided. A gate that hides
-    what it is gating is worse than no gate — it manufactures confidence.
-    """
-    before, after = old.splitlines(), new.splitlines()
-
-    head = 0
-    while head < len(before) and head < len(after) and before[head] == after[head]:
-        head += 1
-
-    tail = 0
-    while (
-        tail < len(before) - head
-        and tail < len(after) - head
-        and before[-1 - tail] == after[-1 - tail]
-    ):
-        tail += 1
-
-    removed = before[head : len(before) - tail]
-    added = after[head : len(after) - tail]
-
-    lines: list[str] = []
-    if head:
-        lines.append(f"  {head} unchanged line(s)")
-    for marker, block in (("-", removed), ("+", added)):
-        for line in block[:EDIT_PREVIEW_LINES]:
-            lines.append(f"{marker} {line}")
-        if len(block) > EDIT_PREVIEW_LINES:
-            lines.append(f"{marker} … {len(block) - EDIT_PREVIEW_LINES} more line(s)")
-    if tail:
-        lines.append(f"  {tail} unchanged line(s)")
-
-    if not removed and not added:
-        # Whitespace-only, or a genuine no-op. Either way, say so rather than
-        # printing nothing and leaving the prompt looking like a bug.
-        lines.append("  (no visible change — whitespace only)")
-    return lines
 
 
 def cmd_do(args) -> None:
@@ -636,11 +630,12 @@ def cmd_do(args) -> None:
         print(f"error: no directory at {root}", file=sys.stderr)
         sys.exit(1)
 
-    confirm = agent.always_allow if args.yes else confirm_action
+    confirm = _approve_everything if args.yes else confirm_action
 
     if args.yes:
         print(
-            "warning: --yes approves every write and command without asking",
+            "warning: --yes approves every write and command without asking "
+            "(posting to GitHub still needs a terminal)",
             file=sys.stderr,
         )
 

@@ -76,4 +76,5 @@ include = ["majordomo*"]
 [tool.pytest.ini_options]
 markers = [
     "network: this test genuinely needs the network (nothing does today)",
+    "gh: this test genuinely needs the real gh CLI (nothing does today)",
 ]

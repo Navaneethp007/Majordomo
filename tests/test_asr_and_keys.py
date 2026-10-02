@@ -689,7 +689,11 @@ class Screen:
     the rows — which is how the repeating-prompt bug is visible at all.
     """
 
-    ESCAPE = re.compile(r"\x1b\[(\d*)([ABCJ])")
+    #: Cursor movement and erasure, plus SGR (`m`) — colour and reverse video,
+    #: which move nothing and so are consumed and discarded. Without `m` here,
+    #: a highlighted row's escape bytes land in the text and the row no longer
+    #: reads as what a person would see.
+    ESCAPE = re.compile(r"\x1b\[(\d*)([ABCJm])")
 
     def __init__(self, width=24):
         self.width = width
@@ -813,3 +817,245 @@ def test_the_width_is_never_zero():
     """A division by it happens on every keystroke."""
     with mock.patch.object(keys.shutil, "get_terminal_size", side_effect=OSError):
         assert keys._terminal_width() > 0
+
+
+# ---------------------------------------------------------------------------
+# The arrow-key picker
+#
+# Same machinery as the line editor, so the same test approach: drive it from
+# scripted keystrokes and assert on what the Screen emulator says is visible.
+# Asserting on the escape codes would test the implementation.
+# ---------------------------------------------------------------------------
+
+OPTIONS = [f"202609{i:02d}-1200   {i} turns  topic {i}" for i in range(1, 4)]
+
+
+def pick(chars, options=OPTIONS, width=60):
+    """Run `choose` over a scripted key sequence against a fake screen."""
+    screen = Screen(width=width)
+    with mock.patch.object(keys, "raw_reads_available", return_value=True), _raw(chars):
+        with mock.patch.object(keys, "_ansi_available", return_value=True):
+            with mock.patch.object(keys, "_terminal_width", return_value=width):
+                chosen = keys.choose("Which conversation?", options, stream=screen)
+    return chosen, screen
+
+
+def test_enter_takes_the_first_option_by_default():
+    chosen, screen = pick([ENTER])
+    assert chosen == 0
+    assert "Which conversation?" in screen.rows[0]
+
+
+def test_down_then_enter_takes_the_second():
+    chosen, _ = pick([*DOWN, ENTER])
+    assert chosen == 1
+
+
+def test_up_from_the_top_wraps_to_the_bottom():
+    """Wrapping, because a list you cannot get to the end of in one keypress is
+    a list you scroll past."""
+    chosen, _ = pick([*UP, ENTER])
+    assert chosen == len(OPTIONS) - 1
+
+
+def test_home_and_end_jump():
+    assert pick([*END, ENTER])[0] == len(OPTIONS) - 1
+    assert pick([*END, *HOME, ENTER])[0] == 0
+
+
+def test_the_selected_row_is_marked_as_well_as_highlighted():
+    """A highlight alone is invisible in a terminal whose theme ignores reverse
+    video, and in a screenshot."""
+    _, screen = pick([*DOWN, ENTER])
+    marked = [row for row in screen.rows if row.strip().startswith(">")]
+    assert len(marked) == 1
+    assert "topic 2" in marked[0]
+
+
+def test_escape_cancels_without_choosing():
+    chosen, _ = pick(["\x1b"])
+    assert chosen is None
+
+
+def test_ctrl_c_is_an_interrupt_not_a_refusal():
+    """`cli.ask` was fixed to keep this distinction: "I changed my mind" is not
+    the same as "I picked nothing"."""
+    with pytest.raises(KeyboardInterrupt):
+        pick(["\x03"])
+
+
+def test_the_list_does_not_repeat_itself_as_you_move():
+    """The bug the line editor had: without tracking how many rows went down,
+    every keystroke repaints below the last paint instead of over it."""
+    _, screen = pick([*DOWN, *DOWN, *UP, ENTER])
+    prompts = [row for row in screen.rows if "Which conversation?" in row]
+    assert len(prompts) == 1
+
+
+def test_a_long_list_scrolls_rather_than_painting_everything():
+    """A picker taller than the terminal cannot be repainted — the rows it would
+    move back up to have already scrolled away."""
+    many = [f"session {i}" for i in range(40)]
+    _, screen = pick([*DOWN] * 15 + [ENTER], options=many)
+
+    visible = [row for row in screen.rows if row.strip().startswith(("session", "> session"))]
+    assert len(visible) <= keys.VISIBLE_OPTIONS
+    assert any("16/40" in row for row in screen.rows)   # says where you are
+
+
+def test_an_empty_list_chooses_nothing_without_reading_a_key():
+    """No keys are scripted, so this would hang if it tried to read one."""
+    assert keys.choose("Which?", [], stream=Screen()) is None
+
+
+def test_without_raw_reads_it_falls_back_to_a_number():
+    """A pipe has no arrow keys. Same degradation as `read_line`."""
+    screen = Screen(width=60)
+    with mock.patch.object(keys, "raw_reads_available", return_value=False):
+        with mock.patch("builtins.input", return_value="2"):
+            assert keys.choose("Which?", OPTIONS, stream=screen) == 1
+
+    printed = "\n".join(screen.rows)
+    assert "1." in printed and "2." in printed      # numbered, so a number means something
+
+
+@pytest.mark.parametrize("answer", ["", "nonsense", "0", "99"])
+def test_a_bad_number_cancels_rather_than_guessing(answer):
+    with mock.patch.object(keys, "raw_reads_available", return_value=False):
+        with mock.patch("builtins.input", return_value=answer):
+            assert keys.choose("Which?", OPTIONS, stream=Screen()) is None
+
+
+def test_the_picker_prints_nothing_a_windows_console_cannot_encode():
+    """It writes straight to the stream, not through `cli.safe_print`, so there
+    is nothing to catch a UnicodeEncodeError — and a default Windows console is
+    cp1252, which has no arrow glyphs. An "up/down" hint written with ↑↓ would
+    crash the picker on the one platform this is written for.
+    """
+    screen = Screen(width=60)
+    pick([*DOWN, ENTER], options=[f"session {i}" for i in range(40)])
+
+    _, screen = pick([ENTER], options=[f"session {i}" for i in range(40)])
+    everything = "\n".join(screen.rows)
+    everything.encode("cp1252")        # raises if anything is unencodable
+
+
+# ---------------------------------------------------------------------------
+# pick_conversation — the callers, which nothing reached
+#
+# `mj chat --resume` with no id crashed on its first real use: the signature
+# changed and the call site did not follow. Zero tests touched either caller,
+# and the reason is worth recording — the branch is guarded by
+# `stdin_is_interactive()`, which is the right guard for scripts and also what
+# makes it invisible to a test harness. The condition that makes it safe is the
+# condition that hides it. The `stream=` seam existed precisely so a test could
+# aim it somewhere; it simply had no test using it.
+# ---------------------------------------------------------------------------
+
+
+def saved(home, *stems):
+    chats = home / "chats"
+    chats.mkdir(parents=True, exist_ok=True)
+    for stem in stems:
+        (chats / f"{stem}.jsonl").write_text(
+            '{"role": "user", "content": "hello there", "at": ""}\n', encoding="utf-8"
+        )
+
+
+def test_the_resume_flag_with_no_id_opens_the_picker(isolated_home, monkeypatch):
+    """The crash: cmd_chat passed the chat *module* as the output stream."""
+    from majordomo import cli
+
+    saved(isolated_home, "20260921-1102", "20260926-1431")
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: True)
+
+    chosen = {}
+    monkeypatch.setattr(
+        "majordomo.chat.run",
+        lambda config, **kwargs: chosen.update(kwargs),
+    )
+    # Enter takes the first, which is the newest.
+    with mock.patch.object(keys, "choose", return_value=0) as picker:
+        cli.main(["chat", "--resume"])
+
+    assert picker.called
+    assert chosen["transcript"].name == "20260926-1431.jsonl"
+    assert chosen["resume"] is True
+
+
+def test_cancelling_the_picker_resumes_nothing(isolated_home, monkeypatch, capsys):
+    from majordomo import cli
+
+    saved(isolated_home, "20260926-1431")
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: True)
+    monkeypatch.setattr("majordomo.chat.run", lambda *a, **k: pytest.fail("should not open"))
+
+    with mock.patch.object(keys, "choose", return_value=None):
+        cli.main(["chat", "--resume"])
+
+    assert "nothing resumed" in capsys.readouterr().out
+
+
+def test_a_script_passing_resume_still_takes_the_newest(isolated_home, monkeypatch):
+    """The guard earns its place: a pipe must not block on a picker."""
+    from majordomo import cli
+
+    saved(isolated_home, "20260926-1431")
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: False)
+
+    seen = {}
+    monkeypatch.setattr("majordomo.chat.run", lambda config, **kwargs: seen.update(kwargs))
+    with mock.patch.object(keys, "choose", side_effect=AssertionError("no picker")):
+        cli.main(["chat", "--resume"])
+
+    assert seen["transcript"] is None      # `run` resolves the newest itself
+    assert seen["resume"] is True
+
+
+def test_the_picker_reports_having_nothing_through_the_caller(isolated_home):
+    """`write` is injected, which was the only real reason this lived in cli."""
+    from majordomo import session as session_mod
+
+    said = []
+    assert session_mod.pick_conversation(said.append) is None
+    assert "No saved conversations yet." in said
+
+
+def test_the_repl_and_the_cli_use_the_same_picker():
+    """Two of them would drift, and the second is the one nobody tests."""
+    from majordomo import chat, session as session_mod
+
+    assert chat.pick_conversation is session_mod.pick_conversation
+
+
+def test_the_repl_does_not_import_the_cli():
+    """`cli` is the outermost layer — the one module that catches the typed
+    exceptions raised below it — and nothing imported it until the picker did,
+    which made a chat -> cli -> chat cycle that worked only because the imports
+    sat inside functions."""
+    import pathlib
+
+    source = pathlib.Path(chat.__file__).read_text(encoding="utf-8")
+    assert "import cli" not in source
+
+
+# --- clamping to the terminal ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "lines,expected",
+    [(24, 10), (12, 10), (11, 9), (8, 6), (3, 1), (2, 1), (1, 1)],
+)
+def test_the_window_fits_the_terminal(monkeypatch, lines, expected):
+    """A list taller than the terminal cannot be repainted — the rows it would
+    move back up to have already scrolled away. The docstring named that hazard
+    and the first version measured only the width."""
+    monkeypatch.setattr(keys, "_terminal_height", lambda stream=None: lines)
+    assert keys._visible_count() == expected
+
+
+def test_a_short_terminal_paints_within_its_height(monkeypatch):
+    """Prompt + options + hint must fit, or the move-up arithmetic lands wrong."""
+    monkeypatch.setattr(keys, "_terminal_height", lambda stream=None: 8)
+    _, screen = pick([ENTER], options=[f"session {i}" for i in range(40)])
+    assert len(screen.rows) <= 8

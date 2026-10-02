@@ -74,3 +74,61 @@ def no_real_network(monkeypatch, request):
         monkeypatch.setattr(httpx.Client, name, refuse, raising=False)
     for name in ("get", "post", "put", "delete", "patch", "request", "stream"):
         monkeypatch.setattr(httpx, name, refuse, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_real_gh(monkeypatch, request):
+    r"""**No test may run the real `gh`.** Anything that tries fails loudly.
+
+    The sibling of ``no_real_network``, and the stakes are strictly higher. That
+    fixture exists because a stale mock quietly spent the developer's own API
+    allowance. A test that reaches real ``gh`` does not spend an allowance — it
+    **writes to a third party under the developer's identity**: opens a real pull
+    request, comments on a real issue, perhaps on somebody else's repository.
+    There is no quota draining to notice, and the *success* case is the bad case.
+
+    Deliberately not a blanket ``subprocess`` block. The git tool's tests run
+    real git in a temporary repository, and ``run_command``'s have always shelled
+    out — both are safe and both are better than mocking. Only ``gh`` is refused.
+
+    The check is on the **resolved executable**, not on ``argv[0]``. ``_run``
+    passes what ``shutil.which`` returned, so on this machine that is
+    ``C:\Program Files\GitHub CLI\gh.exe`` and a test for ``argv[0] == "gh"``
+    would miss every real call. Patch the seam the code actually calls.
+
+    ``@pytest.mark.gh`` opts out, for symmetry with ``@pytest.mark.network``.
+    Nothing uses it.
+    """
+    if "gh" in request.keywords:
+        return
+
+    import subprocess
+    from pathlib import Path
+
+    real_run, real_popen = subprocess.run, subprocess.Popen
+
+    def names(command) -> list[str]:
+        if isinstance(command, (str, bytes)):
+            # shell=True: a whole command line. Checked loosely, because
+            # `run_command` legitimately builds strings and a shell command
+            # mentioning gh is rare enough that a false positive is cheap.
+            text = command.decode() if isinstance(command, bytes) else command
+            return [text.split()[0]] if text.split() else []
+        return [str(part) for part in (command or [])][:1]
+
+    def is_gh(command) -> bool:
+        return any(Path(name).stem.lower() == "gh" for name in names(command))
+
+    def guard(original):
+        def checked(command, *args, **kwargs):
+            if is_gh(command):
+                raise RuntimeError(
+                    "this test tried to run the real `gh` — it would act on "
+                    "GitHub as you. Patch majordomo.tools._run instead."
+                )
+            return original(command, *args, **kwargs)
+
+        return checked
+
+    monkeypatch.setattr(subprocess, "run", guard(real_run))
+    monkeypatch.setattr(subprocess, "Popen", guard(real_popen))

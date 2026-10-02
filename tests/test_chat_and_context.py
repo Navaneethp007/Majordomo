@@ -1980,3 +1980,21 @@ def test_a_reply_that_is_only_the_marker_still_stores_something():
     cleaned, fact = chat._proposed_memory("REMEMBER: He prefers dark roast.")
     assert cleaned.strip() != ""
     assert fact == "He prefers dark roast."
+
+
+def test_the_hand_off_offer_uses_the_same_marker_as_a_reply():
+    """It read `mj  >` while every ordinary reply read `mj  ›`, which looks
+    like two different things are speaking. The offer *is* a reply, with a
+    question attached."""
+    import pathlib
+
+    source = pathlib.Path(chat.__file__).read_text(encoding="utf-8")
+    assert "mj  > " not in source
+
+
+def test_chat_is_told_not_to_hand_off_an_unanswerable_task():
+    """From a real session: it handed over "the user has not said which repo
+    yet", which cost a confirmation, a model call and a reply that only asked
+    the question chat could have asked itself."""
+    system = prompts.build_chat_system_prompt("")
+    assert "Hand off only what the agent can act on" in system

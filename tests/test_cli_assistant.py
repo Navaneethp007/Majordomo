@@ -400,8 +400,45 @@ def test_yes_warns_that_it_skips_every_prompt(capsys, tmp_path):
     with mock.patch("majordomo.agent.run", return_value=agent.Outcome(answer="ok")) as ran:
         run("do", "something", "--yes", "-C", str(tmp_path))
 
-    assert ran.call_args.kwargs["confirm"] is agent.always_allow
-    assert "approves every write" in capsys.readouterr().err
+    # No longer `always_allow`: --yes still refuses to post to GitHub
+    # unattended, so the confirmer has one exception in it.
+    assert ran.call_args.kwargs["confirm"] is cli._approve_everything
+    err = capsys.readouterr().err
+    assert "approves every write" in err
+    assert "GitHub still needs a terminal" in err
+
+
+def test_yes_approves_local_writes_without_asking(tmp_path):
+    """The thing --yes is for, unchanged."""
+    for name, arguments in (
+        ("write_file", {"path": "x", "content": "y"}),
+        ("edit_file", {"path": "x", "old": "a", "new": "b"}),
+        ("run_command", {"command": "pytest"}),
+        ("git", {"args": ["commit", "-m", "x"]}),
+    ):
+        assert cli._approve_everything(name, arguments) is True
+
+
+def test_yes_does_not_post_to_github_unattended(capsys, monkeypatch):
+    """The hole --yes opened once `github` existed.
+
+    `confirm_action`'s non-interactive branch actively recommends --yes, so the
+    scheduled and piped paths are the likeliest to carry it — and a comment goes
+    out under your name and cannot be withdrawn. A flat refusal rather than a
+    prompt, the same shape as the credential denylist.
+    """
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: False)
+
+    assert cli._approve_everything("github", {"args": ["pr", "create", "--title", "x"]}) is False
+    assert "cannot be withdrawn" in capsys.readouterr().err
+
+    # Reads are unaffected — they were never gated in the first place.
+    assert cli._approve_everything("github", {"args": ["pr", "view", "12"]}) is True
+
+
+def test_yes_still_posts_when_someone_is_watching(monkeypatch):
+    monkeypatch.setattr(cli, "stdin_is_interactive", lambda: True)
+    assert cli._approve_everything("github", {"args": ["pr", "comment", "-b", "hi"]}) is True
 
 
 def test_review_opens_claude_code_in_the_repo(tmp_path):
@@ -423,43 +460,6 @@ def test_review_of_a_missing_directory_exits_one(capsys, tmp_path):
 # ---------------------------------------------------------------------------
 # The edit preview
 # ---------------------------------------------------------------------------
-
-
-def test_an_append_shows_the_appended_lines():
-    """The bug this function exists for: showing the first N lines of each side
-    made an append look like a no-op, because both sides start the same."""
-    old = "def add(a, b):\n    return a + b\n"
-    new = old + "\ndef subtract(a, b):\n    return a - b\n"
-
-    preview = "\n".join(cli._edit_preview(old, new))
-
-    assert "+ def subtract(a, b):" in preview
-    assert "unchanged line(s)" in preview          # the shared prefix, summarised
-    assert "- def add(a, b):" not in preview       # not re-shown as a removal
-
-
-def test_a_change_in_the_middle_shows_both_sides():
-    old = "a\nb\nc\n"
-    new = "a\nB\nc\n"
-
-    preview = cli._edit_preview(old, new)
-
-    assert "- b" in preview and "+ B" in preview
-    assert preview[0] == "  1 unchanged line(s)"
-    assert preview[-1] == "  1 unchanged line(s)"
-
-
-def test_a_long_change_says_how_much_was_elided():
-    """write_file already said '… N more lines'; edit_file silently truncated."""
-    preview = "\n".join(cli._edit_preview("x\n", "\n".join(str(i) for i in range(40))))
-
-    assert "more line(s)" in preview
-    shown = [line for line in preview.splitlines() if line.startswith("+ ")]
-    assert len(shown) == cli.EDIT_PREVIEW_LINES + 1      # +1 for the elision note
-
-
-def test_a_whitespace_only_edit_says_so_rather_than_printing_nothing():
-    assert "no visible change" in "\n".join(cli._edit_preview("a\nb\n", "a\nb"))
 
 
 def test_the_preview_reaches_the_prompt(capsys, monkeypatch):

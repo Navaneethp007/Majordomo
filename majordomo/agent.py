@@ -38,9 +38,30 @@ SYSTEM = (
     "before you edit it, so the edit matches what is actually there. Prefer "
     "edit_file over write_file for an existing file — a full rewrite discards "
     "anything you did not know was in it.\n\n"
-    "Writes and commands are shown to the user for approval before they run. "
-    "If one is declined, do not try the same thing again — either find another "
-    "way or explain why you cannot.\n\n"
+    "Use the git tool for the repository you are in, and the github tool for "
+    "anything on GitHub — including a repository you do not have locally, which "
+    "it reaches with --repo owner/name. Do not search the disk for a repo that "
+    "lives on GitHub, and do not fall back to run_command for git: it has to "
+    "ask permission even for `git status`. Pass their arguments as a list: "
+    "[\"log\", \"--oneline\", \"-5\"].\n\n"
+    "Do not guess an identifier you were not given. If you need a repository's "
+    "owner, or an issue number, find it with the github tool — "
+    "[\"search\", \"repos\", \"<name>\"] — or stop and ask. A plausible guess "
+    "that turns out to be somebody else's repository wastes the turn and "
+    "reports on the wrong thing.\n\n"
+    "Three things can happen when you call a tool, and they need different "
+    "responses:\n"
+    "- It runs. Reading is free — files, listings, searches, git status, git "
+    "log, diff --stat, branch listings, and reading pull requests and issues. "
+    "Batch these; nobody is interrupted by them.\n"
+    "- It is shown to the user for approval first. Writes, commands, commits, "
+    "pushes, and anything posted to GitHub, along with git commands that print "
+    "file contents. If the user declines one, do not try the same thing again — "
+    "find another way or explain why you cannot.\n"
+    "- It is refused outright, and the result says so. Credential files, "
+    "force-pushing, `gh auth`. A refusal will not change on a second attempt, "
+    "so do not rephrase it: stop, and tell the user what you were trying to do "
+    "and why it needs them.\n\n"
     "A tool result beginning with ERROR is information, not a dead end. Read it "
     "and adjust.\n\n"
     "When the task is done, say what you changed in a sentence or two. Do not "
@@ -56,6 +77,16 @@ class Step:
     arguments: dict
     result: str
     approved: bool = True
+    #: The gate fired for this call — the predicate said it changes the world.
+    #:
+    #: Recorded rather than re-derived. ``approved`` cannot stand in for it:
+    #: that defaults True for calls nobody was asked about, so every ``read_file``
+    #: would read as a change. And asking ``tools`` again afterwards would re-run
+    #: a predicate on arguments that may be malformed, outside the ``try`` that
+    #: protected it the first time — and has no answer at all for the
+    #: unknown-tool and ``__malformed__`` steps, which have no ``Tool`` behind
+    #: them.
+    gated: bool = False
 
 
 @dataclass
@@ -67,10 +98,22 @@ class Outcome:
 
     @property
     def changed_anything(self) -> bool:
-        return any(
-            step.approved and step.name in ("write_file", "edit_file", "run_command")
-            for step in self.steps
-        )
+        """Did anything authorised to change the world actually run?
+
+        Note the wording. A gated call that ran and *failed* — ``git commit``
+        with nothing staged — still counts, because this reads the gate's
+        decision rather than the outcome. Parsing exit codes to sharpen that
+        would mean a detector per tool, which is how this project has repeatedly
+        got itself into trouble.
+
+        Derived from ``Step.gated`` rather than a list of tool names. The list
+        was a second, independent encoding of write-ness, and it would have
+        reported "nothing changed" after a ``git commit`` — a rule stated
+        correctly in one place and not applied to its sibling, which is the
+        defect shape this codebase keeps producing. One predicate decides, once,
+        and the answer is recorded.
+        """
+        return any(step.gated and step.approved for step in self.steps)
 
 
 def last_result(outcome) -> str:
@@ -186,9 +229,22 @@ def _run_one(call, project: Path, confirm, write) -> Step:
             "JSON object.",
         )
 
+    # Before the gate: a call that cannot run must not interrupt anyone to ask
+    # about it. A real session showed `git (bad arguments)` / `allow this?` /
+    # `git (bad arguments)` — a prompt approving nothing, spending the only
+    # thing the gate has, which is being worth reading.
+    unusable = tool.unusable(call.arguments)
+    if unusable:
+        return Step(call.name, call.arguments, unusable)
+
     described = tools.describe_call(call.name, call.arguments)
 
-    if tool.needs_confirmation:
+    # Asked once, of this specific call, and the answer carried into the Step.
+    # Some tools are a read or a write depending on their arguments — `git log`
+    # against `git commit` — so this is a question about the call, not the tool.
+    gated = tool.requires_approval(call.arguments)
+
+    if gated:
         if not confirm(call.name, call.arguments):
             # A refusal is a result, not an abort. The model can adapt; ending
             # the run would throw away everything done so far.
@@ -198,6 +254,7 @@ def _run_one(call, project: Path, confirm, write) -> Step:
                 "The user declined this action. Do not retry it — find another "
                 "way, or explain why you cannot.",
                 approved=False,
+                gated=True,
             )
     # Announced once the gate is passed, whichever branch got us here. This
     # used to sit in an `else`, so harmless reads were announced and approved
@@ -214,4 +271,4 @@ def _run_one(call, project: Path, confirm, write) -> Step:
     except Exception as exc:  # pragma: no cover - defensive
         result = f"ERROR: {call.name} failed: {exc}"
 
-    return Step(call.name, call.arguments, result)
+    return Step(call.name, call.arguments, result, gated=gated)

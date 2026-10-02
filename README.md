@@ -224,10 +224,38 @@ mj start <idea>           scaffold a repo, write a brief, open Claude Code
   --dry-run               print what would happen, create nothing
 ```
 
-`mj do` reads, greps and lists freely; **every write, edit and command is shown and
-confirmed first**, and paths are confined to the directory you launched from. Credential
-files — `.env`, `.ssh/`, `*.pem` and friends — are refused outright, including reads,
-because a read means the contents reach a model provider.
+The agent has eight tools: read, list, grep, write, edit, run a command, **git**, and
+**GitHub** via the `gh` CLI. So `mj do "commit this"`, `mj do "open a PR for this branch"`
+and `mj do "what do the comments on PR 12 say?"` all work.
+
+What it may do without asking is the interesting part, because it is not simply "reads":
+
+| | |
+|---|---|
+| runs freely | read, list, grep · `git status`, `log`, `diff --stat`, branch listings · `gh pr view`, `pr list`, `issue view`, and `gh api` for GET of a *named path* |
+| shown and confirmed | write, edit, any shell command · `git commit`, `add`, `checkout`, `push` · **and git commands that print file contents** — `show`, bare `diff`, anything with `-p` |
+| refused outright | credential files, however they are reached · force-pushing · `gh auth`, `gh secret` |
+
+Two of those rows are worth the explanation.
+
+**Content-printing git commands are gated even though they only read.** `read_file`
+refuses `.env` outright — a read means the contents reach a model provider, and a leaked
+key cannot be un-leaked — but `git show HEAD:.env` prints the same bytes. Treating git
+reads as free would have opened a new ungated path to exactly what the denylist exists to
+stop. So the denylist reaches into git's arguments too, and `-p` asks first.
+
+**Force-pushing is refused, but `--force-with-lease` is allowed.** The lease form fails
+rather than clobbering when the remote has moved, so refusing it would only push the agent
+toward the dangerous flag.
+
+Paths stay confined to the directory you launched from, and the git tool additionally
+refuses a repository that sits *above* it, since git otherwise walks upward out of the
+project. Both git tools take an argument list rather than a command line, so there is no
+shell: no `&&`, no redirection, no substitution.
+
+`--yes` approves every local write without asking, and still refuses to post to GitHub
+when stdin is not a terminal. A bad commit is recoverable with git; a comment under your
+name on somebody else's pull request is not.
 
 ### Knowing things
 
@@ -286,7 +314,7 @@ what was stored differing from what you were shown.
 pytest
 ```
 
-1106 tests. The suite covers the safety properties directly — path confinement, the
+1357 tests. The suite covers the safety properties directly — path confinement, the
 confirmation gate, what compaction keeps — because those are the parts where being wrong
 is expensive rather than merely annoying.
 

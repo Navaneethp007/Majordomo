@@ -42,6 +42,8 @@ from majordomo.session import (  # noqa: F401
     Session,
     Turn,
     clear,
+    pick_conversation,
+    switch_to,
     compact,
     describe_session,
     estimate_tokens,
@@ -65,6 +67,7 @@ from majordomo.session import _now  # noqa: F401
 HELP = """\
   /context    what memory and activity are loaded
   /clear      start a fresh conversation, keeping the same loaded context
+  /resume     switch to another saved conversation
   /read PATH  hand it a file — text, PDF or Word — to talk about
   /remember [FACT] keep a fact now, or propose some from this conversation
   /build NAME scaffold a repo from this conversation and open Claude Code
@@ -437,7 +440,10 @@ def _offer_agent(session, config, reply, asked_for, terminal: Terminal = HEADLES
     # render, one layer over: the two must be the same text, and the rendering is
     # not part of the text.
     body = "\n\n".join(shown)
-    terminal.write(f"\nmj  > {render_mod.render(body)}\n")
+    # Same marker as an ordinary reply: this *is* one, with an offer attached.
+    # It read as `mj  >` here and `mj  ›` everywhere else, which looks like two
+    # different things are speaking.
+    terminal.write(f"\nmj  › {render_mod.render(body)}\n")
     _restate_last_answer(session, body)
 
     try:
@@ -588,6 +594,28 @@ def _handle_command(line: str, session: Session, config: Config, terminal: Termi
                 terminal.write("")
         else:
             _offer_memories(session, config, terminal)
+        return False
+
+    if command == "/resume":
+        # The banner names your last conversation and used to tell you to
+        # *restart* with a flag to pick it up, which is backwards for something
+        # you want mid-conversation.
+        # Saved *before* the picker runs, so a failure to read the new
+        # transcript cannot cost you the conversation you were in.
+        if session.log:
+            save(session)
+            terminal.write(f"[saved this one to {session.path.name}]")
+
+        chosen = pick_conversation(terminal.write)
+        if chosen is None:
+            return False
+        if chosen == session.path:
+            terminal.write("[already in that one]")
+            return False
+
+        count = switch_to(session, chosen)
+        terminal.write(f"Resumed {count} turns from {chosen.name}.")
+        terminal.write("")
         return False
 
     if command == "/read":
