@@ -1,0 +1,109 @@
+# Run the suite somewhere other than the author's laptop.
+#
+# Two claims are published on PyPI and neither has ever been checked: the
+# metadata says Python 3.10, 3.11 and 3.12, and the README says "nothing is
+# deliberately platform-locked". Every one of the 1,357 tests has only ever run
+# on 3.10.11, on Windows, on one machine. This is what turns those sentences
+# into either facts or a corrected README.
+#
+# Windows first, because that is the platform the project is written for and
+# where a failure matters most. Linux is included to find out whether the
+# portability claim holds — `keys.py` reaches for `msvcrt` and `tts.py` for
+# `winsound`, both inside functions and both guarded, but "the import degrades"
+# and "the suite passes" are different statements.
+#
+# It also catches the thing nothing else can: a test guard rotting. The
+# `no_real_network` fixture exists because a mock silently stopped intercepting
+# and began spending the author's own API allowance, reporting a 401 as though
+# the code were broken. That decay is invisible on the machine where it still
+# works.
+name: tests
+
+# Read-only, explicitly. Without this block the default GITHUB_TOKEN is
+# read/write on contents for a push event, and a test workflow has no business
+# with write. It matters more here than in most repositories: `conftest`'s
+# `no_real_gh` fixture exists precisely because a test reaching real `gh` would
+# write to a third party under the author's identity, and CI is the one place a
+# usable token is sitting in the environment by default. The fixture blocks it;
+# this is the second layer, which is the argument this project makes everywhere
+# else.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a dependency moving under us shows up on a quiet week rather than in the
+  # middle of the next change.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  pytest:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    # Generous against a 70-second local run. The suite shells out to real git
+    # repeatedly and `COMMAND_TIMEOUT` is 120s per call, so a hang on a platform
+    # nobody has tested would otherwise burn the 6-hour default — six times over,
+    # once per matrix cell.
+    timeout-minutes: 15
+    strategy:
+      # Report every cell. Stopping at the first failure hides whether a problem
+      # is one version or all of them, which is the question being asked.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        # The documents extra too: without it those tests exercise only the
+        # "extra not installed" path, which is the half that already worked.
+        run: python -m pip install -e ".[dev,documents]"
+
+      # No git-identity step. There was one, with a comment explaining that the
+      # `repo` fixture "starts from nothing" so a committer name had to be set
+      # here. Both halves of that were false, in opposite directions: the fixture
+      # redirects GIT_CONFIG_GLOBAL to a temporary file, so nothing written to
+      # the runner's ~/.gitconfig could reach the tests at all — and it sets
+      # user.name and user.email itself, repo-locally, two lines after git init.
+      # Verified by running the git tests with HOME relocated and no global
+      # config: 87 passed. A step that cannot do what it claims is worse than no
+      # step, because the claim gets copied into the next workflow.
+
+      - name: pytest
+        run: python -m pytest -q
+
+  wheel:
+    name: the wheel installs and works
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+
+      - name: Install the wheel, not the source tree
+        # The failure this exists for: `config.example.yml` ships as package
+        # data, and `mj config --init` reads it from beside the module precisely
+        # because a wheel has no repo root. Break that and it works perfectly in
+        # an editable install and fails for every real user.
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          mj --version
+          mj config --init
+          mj --help

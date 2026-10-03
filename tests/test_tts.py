@@ -25,6 +25,48 @@ CFG = VoiceConfig(
 # speech_text — the fuser is told to write prose, but models drift into markdown
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _grpc_is_importable(monkeypatch):
+    """Provide a `grpc` module, faking it when the nvidia extra is absent.
+
+    The Riva tests already fake `riva.client` through `_import_riva`, but the
+    adapter also does `import grpc` to catch `FutureTimeoutError` — with a
+    comment that it is "available whenever riva.client imported", which is true
+    in production, where grpc is a riva dependency, and false in a test that
+    fakes one and not the other.
+
+    So these passed only where the extra happened to be installed. They did on
+    this laptop and would not have on any clean runner, Windows included.
+    """
+    import importlib.util
+    import types
+
+    if importlib.util.find_spec("grpc") is not None:
+        return
+
+    fake = types.ModuleType("grpc")
+
+    class FutureTimeoutError(Exception):
+        """Stands in for grpc's, which the adapter catches by name."""
+
+    fake.FutureTimeoutError = FutureTimeoutError
+    monkeypatch.setitem(sys.modules, "grpc", fake)
+
+
+@pytest.fixture(autouse=True)
+def _playback_is_available(monkeypatch):
+    """Pretend an audio player exists, for every test in this file.
+
+    `speak` calls `_check_playback` *first*, on purpose — failing before an API
+    call is spent is the right order. But that means on a machine with no
+    paplay/aplay/ffplay, which is most Linux containers, it raises before any of
+    the errors these tests are actually about. The tests mocked `_play` and not
+    the check, so they passed on Windows (where `winsound` always exists) and
+    failed everywhere else.
+    """
+    monkeypatch.setattr(tts, "_check_playback", lambda: None)
+
 def test_strips_heading_markers():
     assert "#" not in speech_text("## Needs you\n### GitHub")
 

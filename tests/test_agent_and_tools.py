@@ -7,7 +7,9 @@ circles. Those are the parts where being wrong is expensive.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -59,7 +61,8 @@ def final(text):
         "../outside.txt",
         "../../../../etc/passwd",
         "sub/../../outside.txt",
-        "C:/Windows/System32/config/SAM",
+        # Absolute on both: a leading slash is root-relative on Windows too, so
+        # this leaves the project directory either way.
         "/etc/shadow",
     ],
 )
@@ -68,6 +71,21 @@ def test_paths_outside_the_project_are_refused(project, escape):
     works — traversal and symlinks both look ordinary until resolved."""
     with pytest.raises(tools.OutsideProject):
         tools.resolve(project, escape)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive letter is only absolute on Windows")
+def test_a_drive_letter_path_is_refused_on_windows(project):
+    """Split out because what this asserts is "an absolute path escapes", and
+    the spelling of *absolute* is platform-specific.
+
+    `C:/Windows/...` leaves the project on Windows and is an ordinary relative
+    directory called `C:` on Linux, where it stays inside and is correctly
+    allowed. Parametrised together, the case claimed to be about confinement and
+    was really about path syntax — the kind of thing that only shows up on the
+    second platform.
+    """
+    with pytest.raises(tools.OutsideProject):
+        tools.resolve(project, "C:/Windows/System32/config/SAM")
 
 
 def test_paths_inside_the_project_resolve(project):
@@ -158,12 +176,12 @@ def test_an_edit_that_matches_nothing_is_refused(project):
 
 
 def test_run_command_returns_output_and_exit_code(project):
-    out = tools.run_command(project, command="python -c \"print('hi')\"")
+    out = tools.run_command(project, command=f'"{sys.executable}" -c "print(chr(104)+chr(105))"' )
     assert "exit code 0" in out and "hi" in out
 
 
 def test_a_failing_command_reports_rather_than_raising(project):
-    out = tools.run_command(project, command="python -c \"import sys; sys.exit(3)\"")
+    out = tools.run_command(project, command=f'"{sys.executable}" -c "import sys; sys.exit(3)"' )
     assert "exit code 3" in out
 
 
@@ -757,7 +775,7 @@ def test_the_last_result_survives_a_failed_model_call(project):
     with mock.patch(
         "majordomo.llm.complete_with_tools",
         replies(
-            tool_reply(call("run_command", command="python -c \"print(42)\"")),
+            tool_reply(call("run_command", command=f'"{sys.executable}" -c "print(42)"' )),
             LLMError("provider rate-limited"),
         ),
     ):
@@ -874,7 +892,7 @@ def test_undecodable_output_never_raises():
 def test_run_command_keeps_a_native_commands_non_ascii(project):
     """This mojibaked before: `text=True` decoded with the locale codec, which
     was right here and wrong for git — and the suite had no case either way."""
-    out = tools.run_command(project, 'python -c "print(chr(0x2014))"')
+    out = tools.run_command(project, f'"{sys.executable}" -c "print(chr(0x2014))"')
     assert EM_DASH in out
 
 
@@ -1377,6 +1395,10 @@ def test_gh_is_announced_with_the_normalised_argv():
     assert described == 'run: gh pr comment -b "two words"'
 
 
+@pytest.mark.skipif(
+    shutil.which("gh") is None,
+    reason="with no gh to resolve, _resolve_exe refuses before the guard can fire",
+)
 def test_the_suite_cannot_reach_real_gh_even_by_accident(tmp_path):
     """The belt to the stub's braces.
 

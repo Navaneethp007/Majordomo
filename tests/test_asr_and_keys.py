@@ -166,9 +166,28 @@ def test_an_unopenable_microphone_is_reported():
 
 
 def test_a_missing_asr_function_id_says_it_is_a_different_one():
-    """The TTS function id will not work here, and the error should say so."""
-    with pytest.raises(asr.ASRError, match="different function"):
-        asr._transcribe_nvidia(b"\x00\x00", 16000, "key", VOICE)
+    """The TTS function id will not work here, and the error should say so.
+
+    Riva is faked rather than required. `_transcribe_nvidia` checks the import
+    before the function id — correctly, since there is no point validating
+    configuration for a library that is absent — so without the stub this test
+    passed only on a machine where the `nvidia` extra happened to be installed,
+    and reported the import error instead of the thing it is about. It passed
+    locally for exactly that reason and would have failed on any clean runner,
+    Windows included.
+    """
+    riva = mock.MagicMock()
+    with mock.patch.dict(
+        "sys.modules",
+        {
+            "riva": riva,
+            "riva.client": riva.client,
+            "riva.client.proto": mock.MagicMock(),
+            "riva.client.proto.riva_audio_pb2": mock.MagicMock(),
+        },
+    ):
+        with pytest.raises(asr.ASRError, match="different function"):
+            asr._transcribe_nvidia(b"\x00\x00", 16000, "key", VOICE)
 
 
 # ---------------------------------------------------------------------------
