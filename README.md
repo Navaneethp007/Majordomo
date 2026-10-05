@@ -31,11 +31,6 @@ Last time: 20260926-1431   14 turns  why is the fuser promoting context items
 you › ▏
 ```
 
-**Why one command.** A tool has one job and a front door made of flags. An assistant is a
-place you go, and its front door is itself. Sixteen subcommands meant knowing what you
-wanted before you arrived — and meant sixteen names that could never change. One door is
-one promise.
-
 **Three names, and they differ on purpose.** You install `majordomo-cli`, you type `mj`,
 and you import `majordomo`. `majordomo` was taken on PyPI by an unrelated package, and
 plain `mj` is refused by it — untaken but not allowed, which the index will only tell you
